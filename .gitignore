@@ -1,0 +1,20 @@
+# 编译产物：体积大且与逻辑无关，禁止读取，也勿纳入版本管理
+/target/
+
+# 编辑器 / 系统临时文件
+*.swp
+.DS_Store
+.idea/
+.vscode/
+*.iml
+Thumbs.db
+
+# 本地运行时生成的配置文件（含用户路径，不纳入版本管理）
+save_path.cfg
+
+# 训练工程产物（合成数据、模型权重、标注缓存，体积大且可重建）
+training/data/
+training/models/
+training/exports/
+training/__pycache__/
+training/.cache/

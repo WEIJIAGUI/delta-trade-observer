@@ -1,0 +1,15 @@
+# 就近镜像源（适用于中国大陆环境）
+# 作用：加速「首次 / 全新环境」的依赖下载。
+# 注意：依赖一旦下载会进入 ~/.cargo/registry 缓存，后续 cargo build 不再重新下载；
+#       编译耗时（CPU）由本机性能决定，镜像无法加速编译本身。
+[source.crates-io]
+replace-with = "rsproxy-sparse"
+
+[source.rsproxy-sparse]
+registry = "sparse+https://rsproxy.cn/index/"
+
+[registries.rsproxy]
+index = "https://rsproxy.cn/crates.io-index"
+
+[net]
+git-fetch-with-cli = true
