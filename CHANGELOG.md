@@ -2,6 +2,66 @@
 
 > 每次修改后追加一条。后续会话先读 `PROJECT.md` + 本文件即可，无需重载全部上下文、无需重读整个项目。
 
+## 2026-10-01（续2）— 模板匹配预处理归一化（精度从全空→0.9+）+ GAUGE12 注释同步
+- **问题**：用户确认数字截图（坐标）无误，但模板匹配识别效果差。实测复刻 NCC 管线：真实游戏数字对 10 个模板的 NCC 仅 `0.21~0.34`（全部低于 0.65 阈值 → price 全空）。但逐位肉眼核对字形与模板高度相似 → 字体并非主因。
+- **根因（定位）**：旧管线 `to_feature` 直接把 12×20 整框拉伸到 32×32。真实数字在裁剪框内**顶部对齐、下方大片黑**，而模板数字**居中**；二者拉伸后数字位置/留白不一致 → NCC 崩溃。属预处理缺陷，非模板字体问题。
+- **修复（`template_match.rs`）**：`to_feature` 替换为 `norm_feature`——灰度→中值去噪→按 `(min+max)/2` 阈值取前景→剔除孤立点→求数字**前景包围盒**→等比缩放最长边至 `DIGIT_FIT=28` 居中贴入 32×32 黑底画布→NCC。空白/低对比框（`MIN_CONTRAST`/少量前景）直接返回 `None` 判空。阈值 `DEFAULT_MATCH_THRESHOLD` 0.65→0.72（真实数字现稳定 0.9+，噪声/图标通常 ≤0.78）。
+- **验证（Python 复刻 + 真实 `1.png` 用当前 GAUGE12 坐标裁全部 9 槽×4 位）**：NCC 跃升至 `0.92~1.00`，价格全部正确读出（如龙息弹「1920」全 0.95+，DART「6440」等）。结论：**模板匹配方向完全可行，无需神经网络**。
+- **config.rs 注释同步**：GAUGE12 用户已改为 12×20 框（原 11×18），更新「数位坐标定位规则」注释——ones≈cell_x+443、tens+432、hundreds+421、thousands+405（千/百间留~16px 容纳逗号）；数位 y=278/438/596（各 row_y 下约 130px，落格子底部）；明确标注首列 +444 等实测偏移，删除旧 282/446/607 与 11×18 描述。
+- **编译踩坑**：LNK1104 本地运行 delta-trade-observer.exe(PID 251752)+残留 cargo(PID 254460) 持锁；taskkill 终止后链接。Rust 实现细节：`copy_from` 需 `use image::GenericImage` 且返回 `Result`（`.ok()?`）；`denoised` 需 `mut`。cargo build 0 error/0 warning。
+- **待用户本地核验**：重跑观察/OCR 测试确认 price 已填；3 位价格的货币图标位阈值边缘（0.72）若误认成数字，上提到 0.8 并排查图标位。
+
+## 2026-10-01（续3）— 匹配阈值落实为硬规则 0.90（低于 90% 一律判无数字）+ 8/0 混淆根因定位
+- **用户新要求**：相似度必须达 90%，低于 90% 一律认为该位置没有数字；并反馈 8 与 0 经常混淆、测试 case 不足。
+- **变更（`template_match.rs`）**：`DEFAULT_MATCH_THRESHOLD` `0.72 → 0.90`，注释改写为硬规则（只可上调不可下调，说明低于 0.90 直接拒绝即消除 8/0 因局部顶环误判）。
+- **变更（`digit.rs`）**：删除 `RETRY_THRESHOLD_FACTOR=0.8` 与 `retry_missing`（旧逻辑会把阈值降到 0.72/0.576，直接违反 90% 规则）。`recognize`/`recognize_detail` 改为单遍、统一 0.90，**不存在放宽重试**；模块文档同步。
+- **8/0 混淆根因（实证，非模板字体问题）**：用 `1.png` 真实截图逐位裁出 9 槽×4 位，配合价格条 ASCII 可视化确认——交易行数字实际约 **15px 宽、相邻间距仅 11px**，而数位框仅 **12px 宽**。固定框裁出的常是数字**局部或邻位碎边**：「8」被裁成上半截后顶环极像「0」。加宽框到 18px 反而更差（把相邻数字也框入，36/36 全低于 0.90）。
+- **结论（回答「模板匹配方向是否可取」）**：模板匹配本身没问题——**干净完整裁出的数字 NCC 稳定 0.9~1.0**（如龙息弹 8 达 0.935、个位 0 达 1.000）。精度瓶颈在**固定框切分**，不在匹配器；神经网络替代方案同样要先过这一关（需足量真实数字标注样本），属过度工程，**不推荐**。`cargo build` 0 error/0 warning（仅被杀进程遗留增量锁告警，无害）。
+- **下一步（待用户确认）**：0.90 规则 + 当前 12px 框下，被框切到局部的位仅 0.6~0.85 → 按规则判无数字，符合「宁可不认也不认错」，但召回约减半。要同时保住精度与召回，须把「固定 4 框」改为**整条价格带连通域切分**（用 GAUGE12 推导整条价格包围盒，按列投影找数字间空白切分）。此改动触及坐标使用方式，且用户曾表示数字截图无误，故先提方案待确认再实施。
+
+## 2026-10-01（续）— 「价格浏览」滑块改为上一个/下一个按钮（修正回弹 0）
+- **问题**：用户反馈「价格浏览」滑块每次调整完会回到 0、调整不生效。根因：`Slider::new(&mut sel, ...)` 绑定的是**局部变量** `sel`（main.rs 原 829/835 行），从未写回 `app.ocr_test_selected`；每帧 `sel` 被重新从 `app.ocr_test_selected`（仍为 0）初始化 → 滑块每次回弹 0。
+- **修复**：删除 Slider，改为「◀ 上一个 / 下一个 ▶」按钮（`ui.add_enabled` 边界禁用），点击时直接 `app.ocr_test_selected = cur ± 1` 写回；按钮下方显示「（第 X / Y 个）」。改写后选中态由 `app.ocr_test_selected` 持久化，数字纹理重建逻辑（依赖 `app.ocr_test_selected` 与 `app.ocr_test_digit_sel` 比对）自然同步。同时更新相关注释（滑块→按钮）。
+- **编译踩坑**：cargo build 再次报 LNK1104，实为本地运行中的 delta-trade-observer.exe(PID 247624) + 残留 cargo.exe(PID 254676) 持锁；`taskkill /F /PID` 终止后链接成功（warning: error deleting lock file for incremental 为被杀进程遗留的无害清理告警）。
+
+## 2026-10-01（续4）— 神经网络分类训练子项目 + 「开始观察」勾选保存数字
+- **用户决策**：把模板匹配改为神经网络分类任务。本轮落地**训练项目 + 数据收集**（模型训练与集成回 Rust 作为后续步骤）；x 类别定义由用户人工分类，Rust 端只负责把识别出的数字裁剪落到 `nn-classifier/dataset/<label>/`。
+- **新增 Python 子项目 `nn-classifier/`**：`train.py`（11 类 0-9+x 的轻量 CNN，ImageFolder 加载 `dataset/<label>/`，固定 `CLASSES` 顺序，保存 `model.pt`+`classes.json`，支持 `--export-onnx`）、`predict.py`（单图推理验证）、`requirements.txt`（torch/torchvision/pillow/numpy）、`README.md`（采集/训练/集成说明）。已建 `dataset/{0..9,x}/` 共 11 个空文件夹（含 .gitkeep）。输入约定：灰度→32×32→`(x-0.5)/0.5` 归一化（与未来 Rust 端 ONNX 推理前处理必须一致，已在两端注释标注）。
+- **Rust 端 `observe.rs`**：新增 `digits_dataset_dir()`（优先 env `DELTA_OBSERVER_DIGITS_DIR`，否则从 exe 向上查找含 `nn-classifier/` 的目录取其 `dataset/`，兜底 exe 同目录）。`run_observation` 新增 `save_digits: bool` 参数；观察主循环改用 `recognize_bullet_detail`（与 OCR 测试同源、零重复）拿到每位数位裁剪 `DigitDetail`，勾选时按识别结果归类落盘——识别为 0-9 入对应文件夹，未识别（<90%）入 `x/`；文件名 `d{序号:06}.png`，序号全局自增防覆盖。
+- **Rust 端 `main.rs`**：`ObserverApp` 新增 `save_digits: bool`（默认 false）；「开始观察」面板新增复选框「保存识别到的数字用于训练」（默认关闭，仅勾选时落盘，零额外 IO）；`start_observation` 将勾选态传入观察线程。
+- **清理**：删除因改走 `*_detail` 路径而变为死代码的 `PriceRecognizer::recognize`（`digit.rs`）与 `BulletRecognition::recognize_bullet`（`recognition.rs`），保持 0 warning。`cargo build` 0 error/0 warning。
+- **待用户本地核验**：勾选复选框运行「开始观察」，确认 `nn-classifier/dataset/{0..9,x}/` 下出现裁剪图；人工校正标签后 `pip install -r requirements.txt && python train.py` 训练。模型训练与 ONNX 集成回 Rust 替换模板匹配为后续步骤。
+- **验证**：cargo build 0 error / 0 warning。待用户重跑核验：点「识别」后点击「下一个/上一个」可在各子弹间切换并正确展示逐位数字模板匹配图。
+
+## 2026-10-02 — 数字保留功能改为用户自定义输出目录（移除硬编码训练集路径）
+- **用户新要求**：移除写死到 `nn-classifier/dataset` 的硬编码路径；开启保留功能时**动态显示**一个路径输入框供自定义输出目录；所有保留内容**统一输出到该目录、不做分类处理**。
+- **`observe.rs`**：删除 `digits_dataset_dir()`（env 向上查 `nn-classifier/dataset` 的硬编码解析逻辑）；`run_observation` 新增 `digits_dir: String` 参数；原「按 0-9/x 建子文件夹」逻辑删除，改为所有数位裁剪统一写入用户指定目录（无分类）。`digits_dir` 仅在 `save_digits=true` 且路径非空时 `create_dir_all`，否则为 `None` 全跳过。`digit_seq` 文件名格式 `d{序号:08}_{label}.png`（label=识别出的 0-9，未识别<90% 为 x，仅作人工校正参考，不决定落盘位置）。
+- **`main.rs`**：`ObserverApp` 新增 `digits_save_path: String`（默认 `<save_path>/digits`）；「开始观察」面板复选框「保存识别到的数字」勾选后**动态显示**「数字输出目录」输入框（`TextEdit::singleline`），未勾选时该框不渲染；`start_observation` 将 `digits_save_path` 传入观察线程。输入框**仅在开始观察时读取一次**（不在每次按键写盘），与现有 `save_path` 持久化原则一致，避免配置自我漂移。
+- **编译踩坑**：cargo build 报 LNK1104（本地运行 delta-trade-observer.exe PID 228712 + 残留 cargo 持锁）；`taskkill /F` 释放后链接成功。
+- **验证**：cargo build 0 error / 0 warning。待用户重跑核验：勾选复选框→出现目录输入框→填入路径→「开始观察」后所有数位裁剪落入该单一目录（文件名含序号与标签），不再出现 `nn-classifier/dataset` 子目录结构。
+
+## 2026-10-01 — OCR 测试 Tab「价格浏览」滑块不可见修复 + LNK1104 锁进程
+- **问题**：OCR 测试 Tab 识别后预览大图与「识别汇总」正常，但「价格浏览」滑块（egui::Slider）始终不出现。排查已排除 slots 为空（汇总已显示子弹/价格 → n>0）与识别失败（否则整块不渲染）→ 实为**布局根因**：结果区（预览图 + 280px 汇总 ScrollArea + 滑块）直接挂在 CentralPanel 垂直布局、无外层滚动容器，窗口高度不足时滑块被推到视口外且无滚动条可达。
+- **修复**：OcrTestPanel::show 将结果区整体用 `egui::ScrollArea::vertical()` 包裹（输入卡片固定顶部），滑块置于可滚动区内，任意窗口高度均可滚到。
+- **编译踩坑**：cargo build 报 LNK1104 无法打开 `delta_trade_observer.exe`，实为**本地运行中的 delta-trade-observer.exe(PID 255316) + 残留 cargo.exe(PID 251564) 持锁**；`taskkill /F /PID` 终止两者后链接成功。注：本机 PowerShell 工具输出管道异常（无回显），进程排查改用 `tasklist`/Bash 更可靠。
+- **验证**：cargo build 0 error / 0 warning。待用户重跑核验滑块在任意窗口高度下可滚动到达。
+
+## 2026-09-29（续32）— 数字识别重构为单字符模板匹配 + 静态资源目录
+- **需求**：识别链路改为「调用方先按位切分出单张数字图 → 逐张传入识别函数」。函数**只识别一个字符**，返回 `"0"`~`"9"` 或 `""`（无法识别），**绝不处理位权 / 位数判断 / 多位拼接**。
+- **新增 `src/template_match.rs`（模板匹配，内联实现 TM_CCOEFF_NORMED）**：
+  - 算法等价 OpenCV `cv2.matchTemplate(..., TM_CCOEFF_NORMED)` 的归一化互相关：`Σ(T'·I') / sqrt(ΣT'² · ΣI'²)`（`T'`/`I'` 为减均值后的像素），取值 `[-1.0, 1.0]`。由于输入图与模板已**统一缩放到相同尺寸**，滑动窗口只余单一位置、响应图退化为单个标量，故实现上就是两条特征向量的一次点积，无需真正的逐像素滑窗。
+  - **不引入 `opencv` crate**：其 Rust 绑定依赖本机 OpenCV SDK，编译成本与环境要求远超本模块收益；解码与缩放复用已在用的 `image` crate，**零新增依赖**（符合 `PROJECT.md` 的「依赖精简」约定）。
+  - 预处理管线：灰度化 → 3×3 中值去噪 → `resize` 到 `32×32` → 拉平为 `f32` 特征。输入图与模板**共用同一管线**（`to_feature`），避免分布漂移。
+  - 对外 API：`recognize_digit_image(rgba, w, h)`（默认阈值）/ `recognize_digit_image_th(..., threshold)`（自定义阈值），返回**字符串**（便于调用方直接拼接）。
+  - **阈值可配置**：`pub const DEFAULT_MATCH_THRESHOLD: f32 = 0.65`，注释写明语义与调节经验——调低（<0.5）易把噪声/空位/半个数字误判成某数字（价格凭空多出位数，危害最大），调高（>0.85）易漏判导致少位；默认值取「宁可少认一位，也不认错一位」。
+  - 模板缓存用 `OnceLock`（进程内仅加载一次）；单个模板缺失不影响其余数字，目录缺失则识别恒为空。
+- **模板静态资源**：新建 `assets/digits/`（配 README 说明放置规范与缺失时的兜底做法）。定位顺序：`DELTA_OBSERVER_DIGITS` 环境变量 → 可执行文件目录**向上逐层**（最多 6 层）→ 当前工作目录（沿用历史上 `config/` 的追溯策略）。**换模板图需重启程序**。
+- **`digit.rs` 接入**：`recognize_single_digit` 的后端由 OCR 改为调用 `template_match::recognize_digit_image`（自身只保留「裁出单字符图」这一步）；上层 `recognize_price_digits` 的逐位拼接逻辑与调用方 `observe` **完全未动**。`main.rs` 补 `mod template_match;`。
+- **清理改造后的冗余**（遵循既有克降原则）：删除 `ocr::recognize_price`（整框价格 OCR，唯一调用者消失）、`observe::extract_price`（唯一调用者 `recognize_price` 已删，且价格不再来自 OCR 文本）、`template_match::templates_loaded`（自查辅助，无调用者）；同步更新 `observe.rs` 头部流程注释（第 3/4 步改为「名称走 OCR、价格走逐位模板匹配」）。
+- **验证**：① `cargo build` 通过，**代码相关 0 warning**（仅剩与代码无关的 Windows 增量编译锁文件 `os error 5` 提示）；② 端到端自检 **10/10** —— 以临时生成的 Arial `0~9.png` 同时作为模板与输入，`0`→`"0"` … `9`→`"9"` 全部命中，纯白空图正确返回 `""`（拒识生效）。自检用的临时代码与临时图片**已全部删除**。
+- **待真实环境核验**：实际游戏字体 / 抗锯齿下的命中率与阈值松紧（`0.65` 可能需按实测微调）；模板可取 `DELTA_OBSERVER_DEBUG=1` 运行观察后落盘的 `debug_test_digits/dN_raw.png`。
+
+
 ## 2026-09-27（续27）— 测试观察三处交互缺陷修复：Ctrl 拖拽 + F9 全局兜底 + 价格 OCR 阈值
 - **问题确认（排查结论）**：
   1. 毛玻璃拖拽失效：`test_grid` 旧实现用 `ViewportCommand::StartDrag`（OS 级窗口移动），在透明 AlwaysOnTop 面板上不可靠且无法限定为 Ctrl 组合键，故「无法拖动」。
@@ -281,3 +341,59 @@
   - LNK1104 复现（旧 exe 运行中锁输出文件）→ `Stop-Process` 终止后重编。
 - **编译**：0 error / 0 warning。
 - **验证**：需真实环境核验：① 标题行按住拖动手感；② 九格数字识别准确率（对比旧版通用链路）；③ Testing 态面板覆盖区域会拦截游戏点击（穿透关闭的设计使然，拖开即可）。
+
+## 2026-09-30 — 截图模块独立化重构（src/screenshot.rs）
+- **需求**：将散落在 `win.rs` 的截图逻辑抽为独立模块，提升可读性与可维护性，修复潜在问题，保留区域 / 窗口 / 全屏截图核心能力，与 `observe` / `digit` 等调用方兼容。
+- **改动**：
+  - 新建 `src/screenshot.rs`：承接 `win.rs` 全部截图函数 —— `capture_window_rgba`（整窗抓屏）、`capture_client_rgba`（客户区统一入口，裁标题栏）、`crop_region`（区域裁剪）、`save_rgba_png`（PNG 保存）、`draw_rect_outline`/`draw_digit`（标注）、`client_crop_rect`（客户区偏移）；并新增类型化 `CapturedImage`（`crop`/`draw_rect_outline`/`draw_digit`/`save_png`/`raw`/`dimensions` 方法）作为现代接口面。
+  - `win.rs` 删除上述截图函数，仅保留窗口查找 / 聚焦 / 截图排除 / 毛玻璃 / 模拟键鼠 / 提示音；import 精简（移除仅截图用的 `windows` 符号与 `Storage::Xps`）。
+  - `observe.rs`/`digit.rs` 截图调用前缀 `win::` → `screenshot::`；`digit.rs` 的 `use crate::win` 改为 `use crate::screenshot`。`main.rs` 增加 `mod screenshot;`。
+  - 文档注释同步（`config.rs`/`ocr.rs`/`template_match.rs` 中 `win::crop_region`/`win::capture_client_rgba` 引用改为 `screenshot::`）。
+- **修复的潜在问题**：
+  1. **底层抓屏隐式抢焦点**：原 `capture_window_rgba` 内部调用 `focus_window(hwnd)`，导致观察主循环每帧截图都抢占前台焦点、干扰用户操作。改为不再隐式激活，聚焦由调用方（`observe`）显式完成。
+  2. **`save_rgba_png` 注释与实现不符**：原注释写 `Compression::BestSpeed`（zlib level 1），实际用 `Compression::Fast`（`png` 0.17 无 `BestSpeed` 变体）。修正注释，明确最快档即 `Fast`。
+  3. **坐标类型化**：裸 `[i32;4]` 截图坐标改用模块内 `Rect` 类型别名（`pub type Rect = [i32;4]`，与 `config::Rect` 同源），从类型层降低错配风险（旧实现曾因裸数组静默错配导致裁剪偏移）。
+  4. **裁剪夹紧对称化**：`crop_region`/`draw_rect_outline` 的起点/终点夹紧改为对称 `.min(尺寸)`，消除原 `x0` 用 `.min(w-1)` 的不对称写法，行为等价、更易读。
+- **编译**：`cargo build` 通过，**代码相关 0 warning**（仅一条无害的增量编译锁文件删除提示 `os error 5`，系上轮残留进程持有，与代码无关）。运行期行为（截图 / 裁剪 / 标注 / 观察识别）需真实 Windows + 已启动游戏环境核验。
+
+## 2026-09-30（续）— 截图几何修复：DPI 感知 + DWM 扩展边界剔除阴影
+- **需求**：解决缩放 ≠ 100% 下的截图尺寸错位 / 黑边（典型表现为 1934×1117 而非干净的 1920×1080，多出的 14×37 主要来自 DWM 窗口阴影与标题栏）。
+- **根因（按排查顺序）**：
+  1. **DPI 未感知**：进程原为 DPI-unaware，`GetWindowRect`/`GetClientRect`/`ClientToScreen` 返回虚拟逻辑坐标，与 `PrintWindow` 实际渲染尺寸在缩放下不一致 → 尺寸错位。
+  2. **`GetWindowRect` 含 DWM 阴影**：`capture_window_rgba` 用 `GetWindowRect` 定尺寸，把左右各 ~7px 阴影、标题栏算进来 → +14×+37 主因。
+  3. **抓屏 DC 原点错位**：原用 `GetDC(hwnd)`（客户区 DC，原点在客户区左上）建整窗尺寸位图并 `PrintWindow` 渲染整窗，坐标原点与尺寸不匹配，进一步放大错位。
+- **改动**：
+  - `main.rs` 最早调用 `SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)`（需在创建任何窗口前），`Cargo.toml` 补 `Win32_UI_HiDpi`。使全部坐标 API 与 `PrintWindow` 一致以设备像素取舍。
+  - 新增 `window_visible_rect(hwnd)`：优先 `DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS)` 取**可见窗口**（剔除 DWM 阴影），失败回退 `GetWindowRect`。
+  - `capture_window_rgba` 改用 `window_visible_rect` 定尺寸 + `GetWindowDC`（整窗 DC，原点=窗口左上角），整窗从 (0,0) 渲染、与缓冲严格对齐。
+  - `client_crop_rect` 基准改为同一 `window_visible_rect`（不再用 `GetWindowRect`），客户区偏移与抓屏缓冲坐标系一致，裁剪落点正确。
+- **排除的误判**：目标游戏若为无边框全屏，`window_visible_rect` 与客户区重合（偏移 0），此修复不影响既有全屏路径；仅在有阴影/标题栏的窗口态下消除黑边。
+- **编译**：`cargo build` 通过，**0 warning**。运行期需真实 Windows（缩放 125%/150% 多显示器）截一张图核验是否得到干净 1920×1080。
+
+## 2026-10-01（续）— OCR 测试 Tab + 识别逻辑共享模块
+- **需求**：新增「OCR 测试」Tab——选本地交易行截图 + 选口径 → 复用「开始观察」的识别逻辑识别子弹名称与价格并汇总预览；同时把子弹识别提取为共享模块，UI 与业务逻辑分离、各 Tab 独立。
+- **新增 `src/recognition.rs`（核心共享模块）**：
+  - `BulletRecognition`：持有 `ocr::NameOcr`（名称 OCR，引擎缓存复用）+ `digit::PriceRecognizer`（价格逐位模板匹配），构造一次整周期复用；`recognize_bullet(frame, rects)` 内部按帧宽推导 `Scale` 并识别单枚子弹，返回 `BulletRec{name, price}`。
+  - `recognize_caliber(frame, caliber, cfg)`：遍历该口径全部子弹槽位返回 `Vec<(子弹名, 标定坐标, BulletRec)>`，供 OCR 测试 Tab 直接调用；「开始观察」逐单元格逻辑也复用 `recognize_bullet`。**零重复实现**。
+- **`screenshot.rs`**：
+  - 新增 `CapturedImage::from_file(path)`：`image::open` 解码本地 PNG/JPG → RGBA，使测试 Tab 复用同一套坐标与识别。
+  - 把标注颜色常量（`DIGIT_BOX_COLORS`/`NAME_BOX_COLOR`/`DIGIT_BOX_THICKNESS`/`DIGIT_LABEL_LIFT_PX`）提升为 `pub`，`observe.rs` 与 OCR 测试标注预览共用（消除重复字面量）。
+- **`observe.rs`**：移除散装的 `name_ocr`/`price_recognizer` 与手写每子弹识别块，改调 `BulletRecognition::recognize_bullet`；调试帧颜色引用改为 `screenshot::*` 共享常量。
+- **`main.rs`**：Idle 态加顶部 Tab 栏（`MainTab::{Observe, OcrTest}`）；新增 `OcrTestPanel`（独立组件，仅采集输入 + 展示：图片路径输入框 / 拖拽 / 口径 ComboBox / 识别按钮 / 标注预览图 + 汇总表），识别逻辑全部委托 `crate::recognition::recognize_caliber`，不触碰识别细节。
+- **编译**：`cargo build` 通过，**0 error / 0 warning**（仅一条无害增量编译锁文件删除提示 `os error 5`，系上轮残留进程持有，与代码无关）。运行期需真实 Windows 环境：选一张交易行截图 + 口径点「识别」核验预览标注与价格汇总。
+
+## 2026-10-01（续二）— OCR 测试 Tab：价格浏览滑块 + 逐位数字模板匹配可视化
+- **需求**：OCR 测试 Tab 增加「价格滚动条」浏览不同子弹价格；切换时展示每个数字模板的匹配图片与匹配结果（分数 / 识别出的数字），直观查看模板匹配效果。
+- **`template_match.rs`**：
+  - 新增 `DigitMatchDetail { scores:[f32;10], best_digit:Option<u8>, best_score:f32 }` 与 `match_digit_detail(rgba,w,h)`：返回与 0~9 十个模板各自的 NCC 分数（不做事后阈值截断），供可视化。
+  - 删除被取代的 `recognize_digit_image`（已无调用方），模块/函数文档同步改指 `match_digit_detail`。
+- **`digit.rs`**：
+  - 新增公开 `DigitDetail`（裁剪图 + 各模板分数 + 识别字符 + 最高分），并抽出唯一识别入口 `match_one`（裁剪→模板匹配→阈值判定，同时产出字符与详情）。
+  - `recognize_digits`/`retry_missing` 改为复用 `match_one`；新增 `recognize_detail` 返回 `(PriceRec, Vec<Option<DigitDetail>>)`（千/百/十/个），二轮回填放宽阈值下重算遗漏位的详情使 `recognized` 与最终价格一致。
+- **`recognition.rs`**：新增 `recognize_bullet_detail` 与 `recognize_caliber_detail`（每个子弹附带价格各数位 `DigitDetail`）；删除不再使用的 `recognize_caliber`（OCR 测试已切到 detail 版）。`DigitDetail` 经 `pub use` 对外暴露。
+- **`main.rs`（OcrTestPanel）**：
+  - `OcrSlot` 增 `digits: Vec<Option<DigitDetail>>`；`run()` 改调 `recognize_caliber_detail` 并填充，识别后 `ocr_test_seq += 1` / 选中重置 0。
+  - 新增「价格浏览」滑块（`egui::Slider` 选子弹序号）+ 逐位展示：每个数位给出**裁剪匹配图**（实际数字截图）、识别字符、最高分，以及 0~9 十个模板的**分数条**（`draw_score_bars` 用 Painter 绘制，最佳模板绿色高亮）。
+  - 纹理重建与选中提交放在 `res` 不可变借用作用域之外，渲染块只读，规避借用冲突；数字纹理仅在结果更新或选中变化时重建。
+  - 新增 app 字段 `ocr_test_selected/ocr_test_seq/ocr_test_digit_seq/ocr_test_digit_sel/ocr_test_digit_tex`。
+- **编译**：`cargo build` 通过，**0 error / 0 warning**（增量锁警告 `os error 5` 为被杀进程残留，删 target/debug/incremental 后消失）。需在真实 Windows 环境用一张交易行截图 + 口径点「识别」→ 拖动滑块核验逐位匹配图与分数条。

@@ -15,6 +15,7 @@ windows = { version = "0.52", features = [
     "Win32_Graphics_Gdi",
     "Win32_Storage_Xps",
     "Win32_System_SystemInformation",
+    "Win32_UI_HiDpi",
     "Win32_System_Threading",
     "Win32_System_WinRT",
     "Foundation",
@@ -25,6 +26,17 @@ windows = { version = "0.52", features = [
     "Win32_Media_Audio",
 ] }
 global-hotkey = "0.5"
+rfd = "0.14"
 png = "0.17"
-rfd = "0.15"
 image = "0.25"
+# ONNX Runtime：关闭 directml（不再需要 GPU 加速，且避免运行时依赖 DirectML.dll）
+# 关闭 copy-dylibs（ORT 核心已静态链入 exe，无需把 DirectML.dll 等拷贝到旁边）。
+# 保留：download-binaries（构建期下载 ORT 静态库）、api-27（与默认一致，保证 model.onnx 可加载）、
+# std / ndarray（Tensor::from_array 需要）/ tls-native（HTTPS 下载）。
+ort = { version = "2.0.0-rc.13", default-features = false, features = [
+    "download-binaries",
+    "api-27",
+    "std",
+    "ndarray",
+    "tls-native",
+] }

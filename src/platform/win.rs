@@ -1,23 +1,18 @@
 //! Windows 平台窗口操作封装：查找游戏窗口、激活并聚焦窗口、
-//! 截图排除（SetWindowDisplayAffinity）、毛玻璃（DwmEnableBlurBehindWindow），
-//! 窗口截图（PrintWindow + GetDIBits → PNG），模拟人类键鼠输入（SendInput），
-//! 以及内置轻量提示音合成。
+//! 截图排除（SetWindowDisplayAffinity）、毛玻璃（DwmEnableBlurBehindWindow）、
+//! 模拟人类键鼠输入（SendInput），以及内置轻量提示音合成。
+//!
+//! 截图相关能力（窗口/客户区/区域截图、裁剪、保存、标注）已迁移至独立模块
+//! `src/screenshot.rs`，本文件不再包含截图实现。
 
-use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{BOOL, HMODULE, HWND, LPARAM, POINT, RECT, TRUE, FALSE};
+use windows::Win32::Foundation::{BOOL, HMODULE, HWND, LPARAM, POINT, TRUE, FALSE};
 use windows::Win32::Graphics::Dwm::{DwmEnableBlurBehindWindow, DWM_BLURBEHIND};
-use windows::Win32::Graphics::Gdi::{
-    BitBlt, ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject,
-    GetDC, GetDIBits, HRGN, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, SRCCOPY, SelectObject,
-    ReleaseDC,
-};
+use windows::Win32::Graphics::Gdi::{ClientToScreen, HRGN};
 use windows::Win32::Media::Audio::{PlaySoundW, SND_MEMORY, SND_NODEFAULT};
-use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
-use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
@@ -25,10 +20,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_BACK, VK_CONTROL, VK_RETURN, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetClientRect, GetCursorPos, GetForegroundWindow, GetWindowRect,
-    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
-    SetForegroundWindow, SetWindowDisplayAffinity, SetWindowPos, SetCursorPos, ShowWindow,
-    HWND_TOP, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SW_RESTORE, WINDOW_DISPLAY_AFFINITY,
+    EnumWindows, GetCursorPos, GetForegroundWindow, GetWindowTextLengthW, GetWindowTextW,
+    GetWindowThreadProcessId, IsIconic, IsWindowVisible, SetForegroundWindow,
+    SetWindowDisplayAffinity, SetWindowPos, SetCursorPos, ShowWindow, HWND_TOP, SWP_NOMOVE,
+    SWP_NOSIZE, SWP_SHOWWINDOW, SW_RESTORE, WINDOW_DISPLAY_AFFINITY,
 };
 
 /// 枚举窗口时的上下文：要匹配的关键字 + 命中结果。
@@ -165,245 +160,8 @@ pub fn set_window_blur(hwnd: HWND, enable: bool) {
     }
 }
 
-/// 截取整个窗口（以 `GetWindowRect` 为范围，**含标题栏等非客户区**），返回整窗 RGBA 缓冲与尺寸。
-///
-/// 这是最底层的抓屏源：用 `PrintWindow(PW_RENDERFULLCONTENT)` 渲染整窗（对 DX 游戏最可靠），
-/// 坐标基准 = 窗口左上角（原点），与 `代码配置（src/config.rs）` 记录的 `[x, y, w, h]` 区域坐标一致。
-///
-/// **注意**：此函数返回的是「含标题栏」的整窗缓冲。任何对外输出（默认全屏、口径区域、整窗标注图）
-/// 都应经过 `capture_client_rgba` 裁掉非客户区，且把 `代码配置（src/config.rs）` 坐标减去其返回的 `(ox, oy)` 偏移，
-/// 才能保证标题栏绝不会进入截图范围。
-pub fn capture_window_rgba(hwnd: HWND) -> Result<(Vec<u8>, i32, i32), String> {
-    unsafe {
-        // 截图前确保目标窗口已激活并聚焦（提升对 DX 游戏的兼容性）。
-        focus_window(hwnd);
-
-        let mut wrect: RECT = std::mem::zeroed();
-        if GetWindowRect(hwnd, &mut wrect).is_err() {
-            return Err("获取窗口矩形失败".into());
-        }
-        let full_w = (wrect.right - wrect.left) as i32;
-        let full_h = (wrect.bottom - wrect.top) as i32;
-        if full_w <= 0 || full_h <= 0 {
-            return Err("窗口尺寸无效".into());
-        }
-
-        let hwnd_dc = GetDC(hwnd);
-        if hwnd_dc.is_invalid() {
-            return Err("获取窗口 DC 失败".into());
-        }
-        let mem_dc = CreateCompatibleDC(hwnd_dc);
-        let bitmap = CreateCompatibleBitmap(hwnd_dc, full_w, full_h);
-        let old = SelectObject(mem_dc, bitmap);
-
-        // PW_RENDERFULLCONTENT(0x2)：强制 DWM 渲染完整内容（含非客户区，对 DX 游戏更可靠）。
-        if !PrintWindow(hwnd, mem_dc, PRINT_WINDOW_FLAGS(2)).as_bool() {
-            let _ = BitBlt(mem_dc, 0, 0, full_w, full_h, hwnd_dc, 0, 0, SRCCOPY);
-        }
-
-        let mut bmi: BITMAPINFO = std::mem::zeroed();
-        bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
-        bmi.bmiHeader.biWidth = full_w;
-        bmi.bmiHeader.biHeight = -full_h; // 负数 => 行序自上而下（便于直接编码）
-        bmi.bmiHeader.biPlanes = 1;
-        bmi.bmiHeader.biBitCount = 32;
-        bmi.bmiHeader.biCompression = 0; // BI_RGB
-
-        let mut buf = vec![0u8; (full_w as usize) * (full_h as usize) * 4];
-        GetDIBits(
-            mem_dc,
-            bitmap,
-            0,
-            full_h as u32,
-            Some(buf.as_mut_ptr() as *mut _),
-            &mut bmi,
-            DIB_RGB_COLORS,
-        );
-
-        ReleaseDC(hwnd, hwnd_dc);
-        SelectObject(mem_dc, old);
-        DeleteObject(bitmap);
-        DeleteDC(mem_dc);
-
-        // BGRA -> RGBA（交换 R/B 通道）。
-        for chunk in buf.chunks_exact_mut(4) {
-            chunk.swap(0, 2);
-        }
-
-        Ok((buf, full_w, full_h))
-    }
-}
-
-/// 从整窗 RGBA 缓冲中裁剪出矩形区域 `rect = [x, y, w, h]`（相对窗口左上角）。
-/// 越界部分自动夹紧；区域无效返回 `None`。返回裁剪后的缓冲及**实际**宽高（夹紧后）。
-pub fn crop_region(
-    rgba: &[u8],
-    full_w: i32,
-    full_h: i32,
-    rect: [i32; 4],
-) -> Option<(Vec<u8>, i32, i32)> {
-    let (rx, ry, rw, rh) = (rect[0], rect[1], rect[2], rect[3]);
-    if rw <= 0 || rh <= 0 || full_w <= 0 || full_h <= 0 {
-        return None;
-    }
-    let x0 = rx.max(0).min(full_w - 1) as usize;
-    let y0 = ry.max(0).min(full_h - 1) as usize;
-    let x1 = (rx + rw).max(0).min(full_w) as usize;
-    let y1 = (ry + rh).max(0).min(full_h) as usize;
-    if x1 <= x0 || y1 <= y0 {
-        return None;
-    }
-    let w = x1 - x0;
-    let h = y1 - y0;
-    let stride = full_w as usize * 4;
-    let mut out = Vec::with_capacity(w * h * 4);
-    for y in y0..y1 {
-        let start = y * stride + x0 * 4;
-        out.extend_from_slice(&rgba[start..start + w * 4]);
-    }
-    Some((out, w as i32, h as i32))
-}
-
-/// 将 RGBA 缓冲保存为 PNG 到 `dir/fname`，自动创建目录。
-///
-/// 采用 `png` 原生编码器，压缩等级固定为 `BestSpeed`（zlib level 1）：批量截图场景下，
-/// 编码耗时相比 `image` 默认的 level 6 通常可下降数倍，文件体积仅温和增大——
-/// 对本地截图归档完全可接受，是「速度优先」与「体积可接受」之间的最优平衡点。
-pub fn save_rgba_png(dir: &str, fname: &str, rgba: &[u8], w: u32, h: u32) -> Result<String, String> {
-    std::fs::create_dir_all(dir).map_err(|e| format!("创建目录失败：{e}"))?;
-    let path = Path::new(dir).join(fname);
-    let file = std::fs::File::create(&path).map_err(|e| format!("创建文件失败：{e}"))?;
-    let mut encoder = png::Encoder::new(file, w, h);
-    encoder.set_color(png::ColorType::Rgba);
-    encoder.set_depth(png::BitDepth::Eight);
-    encoder.set_compression(png::Compression::Fast);
-    let mut writer = encoder
-        .write_header()
-        .map_err(|e| format!("PNG 头写入失败：{e}"))?;
-    writer
-        .write_image_data(rgba)
-        .map_err(|e| format!("PNG 编码失败：{e}"))?;
-    Ok(fname.to_string())
-}
-
-/// 截取游戏窗口并**剔除标题栏等非客户区**，返回「客户区缓冲 + 尺寸」。
-///
-/// 这是所有对外截图入口的统一底层：无论窗口处于最大化 / 最小化（已还原）/ 全屏 / 多显示器 /
-/// 不同 Windows 版本，均先以 `PrintWindow` 抓取整窗（对 DX 游戏最可靠），再用 `client_crop_rect`
-/// 裁掉标题栏与边框，从而保证**标题栏绝不会进入任何输出**。无边框 / 全屏下偏移为 0，等同整窗。
-///
-/// **坐标系契约（唯一真相）**：返回的缓冲原点 = 客户区（无标题栏）左上角，与默认 `shot_*.png`
-/// 及 `代码配置（src/config.rs）` 的区域坐标 `[x,y,w,h]` 完全一致（均为客户区左上角基准）。调用方**无需任何偏移换算**，
-/// 可直接用 `代码配置（src/config.rs）` 坐标裁剪。
-pub fn capture_client_rgba(hwnd: HWND) -> Result<(Vec<u8>, i32, i32), String> {
-    let (rgba, w, h) = capture_window_rgba(hwnd)?;
-    match client_crop_rect(hwnd) {
-        Some(rect) => match crop_region(&rgba, w, h, rect) {
-            Some((c, cw, ch)) => Ok((c, cw, ch)),
-            // 极端兜底：客户区裁剪失败仍返回整窗（标题栏可能残留，但保证有图可用）。
-            None => Ok((rgba, w, h)),
-        },
-        None => Ok((rgba, w, h)),
-    }
-}
-
-/// 在 RGBA 缓冲上以 `color`（RGBA）画实心矩形边框（厚度 `thick` 像素），用于标注裁剪区域。
-///
-/// 坐标 `rect = [x, y, w, h]` 相对「客户区（无标题栏）左上角」，与 `代码配置（src/config.rs）` 及 `capture_client_rgba`
-/// 返回的缓冲原点一致；越界部分自动夹紧。作用于已剔除标题栏的客户区缓冲。
-pub fn draw_rect_outline(
-    rgba: &mut [u8],
-    w: i32,
-    h: i32,
-    rect: [i32; 4],
-    color: [u8; 4],
-    thick: i32,
-) {
-    let (rx, ry, rw, rh) = (rect[0], rect[1], rect[2], rect[3]);
-    if rw <= 0 || rh <= 0 || w <= 0 || h <= 0 {
-        return;
-    }
-    let x0 = rx.max(0).min(w - 1) as usize;
-    let y0 = ry.max(0).min(h - 1) as usize;
-    let x1 = (rx + rw).max(0).min(w) as usize;
-    let y1 = (ry + rh).max(0).min(h) as usize;
-    if x1 <= x0 || y1 <= y0 {
-        return;
-    }
-    let t = thick.max(1) as usize;
-    let set = |buf: &mut [u8], x: usize, y: usize| {
-        let idx = (y * w as usize + x) * 4;
-        if idx + 3 < buf.len() {
-            buf[idx] = color[0];
-            buf[idx + 1] = color[1];
-            buf[idx + 2] = color[2];
-            buf[idx + 3] = color[3];
-        }
-    };
-    // 上、下边（含整行范围，便于与左右边形成闭合框）
-    for y in y0..y1 {
-        if y < y0 + t || y >= y1.saturating_sub(t) {
-            for x in x0..x1 {
-                set(rgba, x, y);
-            }
-        }
-    }
-    // 左、右边
-    for x in x0..x1 {
-        if x < x0 + t || x >= x1.saturating_sub(t) {
-            for y in y0..y1 {
-                set(rgba, x, y);
-            }
-        }
-    }
-}
-
-/// 计算客户区（剔除标题栏等非客户区）相对「窗口左上角」的裁剪矩形 `[x, y, w, h]`。
-///
-/// 实现：用 `GetClientRect` 取客户区尺寸，`ClientToScreen(0,0)` 求客户区左上角屏幕坐标，
-/// 再减去 `GetWindowRect` 的窗口左上角屏幕坐标，得到客户区在整窗缓冲中的偏移。
-/// 无边框 / 全屏窗口偏移为 0，等同于整窗（标题栏本就不存在）。
-pub fn client_crop_rect(hwnd: HWND) -> Option<[i32; 4]> {
-    unsafe {
-        let mut crect: RECT = std::mem::zeroed();
-        if GetClientRect(hwnd, &mut crect).is_err() {
-            return None;
-        }
-        let cw = crect.right - crect.left;
-        let ch = crect.bottom - crect.top;
-        if cw <= 0 || ch <= 0 {
-            return None;
-        }
-        // 客户区左上角在客户坐标系中即 (0,0)，转成屏幕坐标后减窗口左上角屏幕坐标。
-        let mut pt = POINT { x: 0, y: 0 };
-        if !ClientToScreen(hwnd, &mut pt).as_bool() {
-            return None;
-        }
-        let mut wrect: RECT = std::mem::zeroed();
-        if GetWindowRect(hwnd, &mut wrect).is_err() {
-            return None;
-        }
-        let ox = pt.x - wrect.left;
-        let oy = pt.y - wrect.top;
-        Some([ox, oy, cw, ch])
-    }
-}
-
-/// 截取整个窗口并保存为 PNG 到 `dir`（默认全屏截图入口）。
-///
-/// 通过 `capture_client_rgba` 统一剔除标题栏等非客户区，保证默认全屏截图只保留内容区、
-/// 永远不会包含标题栏（见 `capture_client_rgba` 的窗口状态兼容性说明）。
-/// 文件名按本地时间生成：`shot_YYYYMMDD_HHMMSS.png`。
-pub fn capture_window_to_png(hwnd: HWND, dir: &str) -> Result<String, String> {
-    let (rgba, w, h) = capture_client_rgba(hwnd)?;
-    let st = unsafe { GetLocalTime() };
-    let fname = format!(
-        "shot_{:04}{:02}{:02}_{:02}{:02}{:02}.png",
-        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond
-    );
-    save_rgba_png(dir, &fname, &rgba, w as u32, h as u32)?;
-    Ok(fname)
-}
+// ====================== 截图功能已迁移至 `src/screenshot.rs` ======================
+// 本文件保留：窗口查找 / 聚焦 / 截图排除 / 毛玻璃 / 模拟键鼠 / 提示音。
 
 /// 合成一段简短的提示音 WAV（PCM 16bit 单声道），双音上行，asset-free。
 /// 返回完整 WAV 字节（含 44 字节文件头）。
@@ -450,7 +208,7 @@ fn build_chime_wav() -> Vec<u8> {
     b
 }
 
-/// 播放一段内存合成的轻量确认提示音（截图成功反馈）。
+/// 播放一段内存合成的轻量提示音（观察完成 / 结束时的确认反馈）。
 ///
 /// 使用 `SND_MEMORY`（内存 WAV）且**同步**播放（不含 `SND_ASYNC`）：
 /// `PlaySoundW` 会在播放完成后才返回，因此函数返回后即可安全释放缓冲区，
@@ -581,7 +339,7 @@ fn send_unicode_char(ch: char) {
 /// 轨迹以 smoothstep 缓动为骨架，每步叠加「平滑随机游走」的横向/纵向偏移
 /// （相邻步偏移相关，既非独立白噪声也非确定性贝塞尔曲线），偏移幅度随进度收敛，
 /// 末端再叠加 ±2px 落点抖动；步间延时随机化（4~14ms）。
-pub fn move_mouse_human(tx: i32, ty: i32) {
+fn move_mouse_human(tx: i32, ty: i32) {
     let (sx, sy) = get_cursor_pos();
     let dx = (tx - sx) as f32;
     let dy = (ty - sy) as f32;
@@ -617,7 +375,7 @@ pub fn move_mouse_human(tx: i32, ty: i32) {
 
 /// 在屏幕坐标 `(x, y)` 处模拟一次人类左键点击：
 /// 先人类化移动到目标（分段随机轨迹），随机延时后按下 → 随机保持 → 抬起。
-pub fn mouse_click_screen(x: i32, y: i32) {
+fn mouse_click_screen(x: i32, y: i32) {
     // 先人类化移动到目标点，再随机延时后点击。
     move_mouse_human(x, y);
     rnd_sleep_ms(40, 120);
@@ -651,7 +409,7 @@ pub fn mouse_click_screen(x: i32, y: i32) {
 }
 
 /// 把客户区坐标 `(x, y)` 转换为屏幕坐标（供鼠标点击）。失败返回 `None`。
-pub fn client_to_screen(hwnd: HWND, x: i32, y: i32) -> Option<(i32, i32)> {
+fn client_to_screen(hwnd: HWND, x: i32, y: i32) -> Option<(i32, i32)> {
     unsafe {
         let mut pt = POINT { x, y };
         if ClientToScreen(hwnd, &mut pt).as_bool() {
