@@ -2,6 +2,248 @@
 
 > 每次修改后追加一条。后续会话先读 `PROJECT.md` + 本文件即可，无需重载全部上下文、无需重读整个项目。
 
+## 2026-10-05（续十七）— 新增「快速调整」：数量滑块就近跳转，加减微调兜底
+
+- **需求**：购买界面加减按钮间存在数量滑块，点击滑块某位置可快速定位到目标数量。锚点 x=1555、y 取加减按钮中间行；先据已知点（目前仅 31）找到离目标最近的参考点跳过去，再从该点用加减按钮精确微调，避免从 1 起逐点累加的大幅连点。
+- **改动（`config.rs`）**：新增 `SLIDER_ANCHOR_X: i32 = 1555`、参考点表 `QTY_SLIDER_REFS: &[(u32,i32)] = &[(31,0)]`（后续可直追加如 `(10,-200)`/`(100,300)` 等，调用逻辑无需改）。
+- **改动（`buy.rs`）**：
+  - 新增纯函数 `nearest_ref_point(target)`（从 `QTY_SLIDER_REFS` 挑离 target 最近的数量值）与 `slider_click_rect(scene, scale, dx)`（滑块点击矩形：x=`SLIDER_ANCHOR_X+dx`，y=按钮行中心，10×10 块，经 `Scale::rect` 映射）。
+  - `adjust_buy_qty`：进入加减循环前先做滑块跳转——识别初始量 `cur0`，仅当 `|ref_qty-target| < |cur0-target|`（跳转后更近）才点滑块；跳转后重识别记日志，失败/未生效则下方循环照常加减微调兜底。避免"越跳越远"。
+- **验证**：`cargo check` 0 错；`cargo test` **7 passed/0 failed**（target_verify 目录规避运行实例持锁 LNK1104）。滑块跳转失败不影响后续加减逻辑，无副作用。
+
+## 2026-10-05（续十六）— 取消数量调整上限，改用「前后 CNN 对比 + 单步最多重试 3 次」
+
+- **需求**：取消 `ADJUST_MAX` 总体次数上限（原 20 次导致 1→31 等跨距被截断、停在 21 报"未能调整到 31"）；改为：每步用 CNN 识别"调整前"数量，点击加/减后用 CNN 识别"调整后"数量并对比；变化=生效继续，未变=自动重试该步（最多 3 次），达 3 次仍无效则停止（不购买）。
+- **改动（`src/domain/buy.rs` · `adjust_buy_qty`）**：
+  - 删除常量 `ADJUST_MAX`（及 `for _ in 0..ADJUST_MAX` 外层循环），改为无限 `loop`，直至 `before==target_qty`→`Confirmed` 或单步重试耗尽→`Unconfirmed`。
+  - 新增 `const MAX_RETRIES: usize = 3`；每步先 `recognize_buy_qty` 记 `before`，选按钮（偏少加/偏多减），`click_client_rect` 派发后等 `ADJUST_STEP_MS`，再 `recognize_buy_qty` 得 `after`；`after != before`→生效 `break`，否则重试（循环 `0..=MAX_RETRIES`，即首次+3 次重试=共 4 次点击）。
+  - 重试耗尽仍 `after == before`→`[WARN] …点击 4 次均无效…` 并返回 `Unconfirmed`；识别失败（`None`）或点击坐标转换失败均立即 `Unconfirmed`（不做无意义重试）。
+  - 移除旧的 `prev`/D3 校验块（其功能已由显式前后对比+重试覆盖，且更精确）。
+- **验证**：`cargo test` **7 passed / 0 failed**（含 `buttons` 端到端模型测试）。无总体上限后，1→31 等任意跨距均可逐步调达；单步失效由重试兜底、超 3 次即止，不存在死循环（每次生效步 ±1 收敛至目标）。
+- 注意：最坏耗时随跨距增长（每步 150ms×最多 4 次点击），但属可接受；若后续需加速可改为连点后识别（待另议）。
+
+## 2026-10-05（续十五）— 补充「数量匹配后购买条件判断」提示：满足/未满足均向用户弹出
+
+- **问题**：用户实测「数量调整到与面板设置一致时程序未出现任何提示」。核查 `buy::verify_then_decide` 的数量匹配分支发现：
+  - 「满足」分支（D 闸门，`QtyAdjustResult::Confirmed`）原有 `tour.ask`，但文案仅问「是否点击购买」，**未显式陈述「满足购买条件」判定结论**；
+  - 「未满足」分支——`QtyAdjustResult::Unconfirmed`（识别失败/超上限/落点失效）与 `scene == None`（场景未判定、无法定位按钮）——**仅有 `crate::log::write` 日志、无 `tour.ask` 提示**，故失败路径静默跳过，用户看不到任何提示（与报告一致）。
+- **修复**（`src/domain/buy.rs`，仍为导游模式提示，关闭态零行为变化）：
+  - 满足：`【确认购买】当前数量 X 发，已与设置(Y发)一致，满足购买条件，是否点击购买？`——明确陈述判定结论。
+  - 未满足（Unconfirmed）：`【未满足购买条件】数量未能调整到设置值 Y 发（识别失败/超上限/落点失效），不满足购买条件，不购买，返回扫描`。
+  - 未满足（scene==None）：`【未满足购买条件】购买界面场景未判定，无法定位按钮、数量未确认，不满足购买条件，不购买，返回扫描`。
+  - 三处均在 `tour.ask` 后紧跟 `stop` 检查，命中即 `Abort`（与原安全闸门一致）。
+- **验证**：`cargo test` **7 passed / 0 failed**（含 `buttons` 端到端模型测试）。提示仅在导游模式开启时出现（毛玻璃叠加层 + 回车确认），关闭则无提示、行为同前。
+
+## 2026-10-05（续十四）— 新增「导游模式」：每步先展示会议文字计划，回车确认后执行
+- **需求**：控制面板新增「导游模式」开关；开启后观察过程中每一步操作先以会议文字形式叠加在毛玻璃层上，使用者回车确认后才执行；覆盖各类场景（检索口径/进入购买/调整数量/确认购买/放弃/跳过），且后续新增逻辑可低成本接入。
+- **架构（新建 `src/tour.rs`）**：`Tour` 协调器以 `Arc<Mutex<Option<(id,text)>>>` + `Arc<(Mutex<u64>, Condvar)>` 实现「后台线程 `ask` 展示并阻塞、UI `confirm` 放行」。
+  - **一次性确认（自增序号）**：`confirm` 只放行「此刻正在展示」的计划序号，连按回车/提前多按均为空操作，杜绝误放行后续步骤（关键健壮性）。
+  - `Tour::disabled()` 下 `ask` 为无操作、`pending_text` 恒 `None`、`confirm` 空操作——故关闭态**零行为变化、零开销**。
+- **接入点**：
+  - `observe::run_observation` 增 `tour: Tour` 参数；每口径检索前 `tour.ask("【计划】开始检索「{cal}」口径子弹")`，`ask` 后立即查 `stop` 退出；并 `tour.clone()` 透传 `verify_then_decide`。
+  - `buy::verify_then_decide` 增 `tour: Tour` 参数；在 进入购买(B)/调整数量(C)/确认购买(D) 三道闸门及 放弃购买/超时/跳过(无阈值·价格无效) 各分支前置 `tour.ask` 等待确认，`ask` 后查 `stop` 返回 `Abort`（不购买），与原安全闸门一致。
+- **UI（`main.rs` / `control_panel.rs` / `floating_panel.rs`）**：
+  - `ObserverApp` 增 `tour_mode: bool` 与运行时 `tour: Tour`；「开始观察」按开关构造 `Tour::new()` / `Tour::disabled()`。
+  - 激活态窗口在导游模式下放大至 `TOUR_FLOAT_SIZE (500×380)` 以容纳导游层。
+  - `update()` 每帧：若有待确认计划则 `ViewportCommand::Focus` 抢焦点（仅此刻，避免常态干扰游戏输入）并检测 `egui::Key::Enter` 调用 `tour.confirm()`；确认后焦点由后台线程下一步动作前交还游戏。
+  - 导游层：`floating_panel` 在状态层之上**额外叠加一层毛玻璃卡片**，展示会议文字计划 + 「按 Enter 确认并执行 · F9 结束观察」。
+  - F9 兜底：`stop()` 若发现有待确认计划，先 `tour.confirm()` 放行被卡住的线程，使其随后据 `stop` 自行退出（避免线程永久阻塞在条件变量）。
+- **可扩展性**：后续任何新增自动化操作只需在执行前调用 `tour.ask(计划文字)` 即可自动获得导游确认能力，无需各自实现确认 UI。
+- **验证**：`cargo check` exit 0；`cargo test` **7 passed/0 failed**（含 `buttons` 端到端模型测试）。主 target 因运行中 .exe 持锁报 LNK1104（环境锁），用 `target_verify` 目录编译链接通过。
+- **注意**：导游模式开启时，无阈值/价格无效的子弹每颗都会弹出「跳过」确认提示，扫描全程需逐颗回车；此为「覆盖各类场景」的代价，可关闭导游模式全自动运行。
+
+## 2026-10-05（续十三）— 修复加减按钮定位缺陷：改用场景标定模板，杜绝误购
+- **根因**：购买阶段加减按钮坐标来自 NN 检测器（`buttons.onnx`）对 `plus/buy` 的分类输出；而该检测器会把「购买」误判为「加号」（`qty_tool.rs` 注释已明文记录、实机已观察到误点购买），且 `buy.rs` 此前未规避——直接用 `det.plus` 点击。数量动态调整（1→31 反复点加）时任一帧误判即变成反复点「购买」。同时 `det` 仅检测一次、整个 `ADJUST_MAX` 循环冻结复用，陈旧且随检测抖动。
+- **修复（D1/D2）**：`adjust_buy_qty` 入参由 `det: &ButtonDet` 改为 `scene: BuyScene`，按钮坐标改由 `scene.layout()`（标定模板）经 `Scale::rect` 映射取得，与 `qty_tool` 同源自 `BUY_LAYOUT_1/2`；检测器（仍调用）只用于判定场景，不再提供点击坐标。`verify_then_decide` 的 `buy_rect` 也改取模板坐标。模板恒定、与数量无关、零检测误差。
+- **加固（D3）**：新增「增减校验」——点击后下一轮复识别，若数量未按预期 ±1（落点失效/点击未生效）立即 `Unconfirmed` 中止，避免对失效落点连续盲点。移除原 `det.plus/minus/buy` 三处 `None` 守卫（模板恒有值）。
+- **验证**：`cargo check` exit 0；`cargo test` **7 passed/0 failed**（含 `buttons` 端到端模型测试）。
+
+## 2026-10-05（续十二）— 代码审查落地：F9 急停透传 / 诊断日志受控 / 数量上限对齐 / 位数决策加固
+- **S1（严重·F9 急停生效）**：`buy::verify_then_decide` / `adjust_buy_qty` 新增 `stop: Arc<AtomicBool>` 参数（由 `observe::run_observation` 透传 `stop.clone()`）。就绪轮询（150ms）与数量调整等待（150ms）改用 `sleep_interruptible` 分片（每 20ms 查一次 stop），长阻塞内 F9 生效延迟降至数十毫秒；收到 stop 即保守返回 `Abort`/`Unconfirmed`，由 `observe` 统一 ESC 退出。彻底解决此前 F9 不立即停的根因（stop 未传入长阻塞分支）。
+- **S2（严重·诊断日志收口）**：`win.rs` 新增 `diag_enabled()` 总开关，仅当 `DELTA_OBSERVER_DEBUG=1|true|yes|on` 时输出 `[CLICK-DIAG]`/`[MOVE-DIAG]` 及其额外 `ClientToScreen(hwnd,(0,0))` 探测；常态运行不再刷坐标细节。此前这些日志永久写入 `observe.log`，既刷屏又每次点击多发一次坐标转换。
+- **H1（高·数量上限对齐）**：`qty_classifier::NUM_CLASSES` 提升为 `pub`；`observe` 在入口对 `buy_qty` 做 `clamp(1, 200)`，UI `control_panel.rs` 的 DragValue `clamp_range` 由 `1..=999` 改为 `1..=200`，与数量整块分类器支持区间一致——避免 UI 越界值导致数量永远无法对齐、盲目重试。
+- **H3（高·位数决策加固）**：`verify_then_decide` 稳定后用**扫描价位数**（`four`）作为读取 3/4 位槽位的权威来源（扫描价与购买价同属一颗子弹、数值一致，且扫描界面数位坐标已充分标定；购买界面 3 位布局「百位」与 4 位布局「千位」同像素 `[298,174]`，单凭图像无法区分 3/4 位，故扫描价是唯一可靠判据）。新增一致性守卫：若稳定价位数与 `four` 明显矛盾则翻转位数重识别一次兜底；注释明确该设计取舍，纠正此前「耦合扫描价」的误读。
+- **M5（中·UI 文案修正）**：`control_panel.rs` 购买数量/阈值提示文案改为与实际「进入购买界面 → 调数量 → 点击购买 → ESC 返回扫描」行为一致（旧文案仍写「点击价格左侧/上方区域并 ESC 恢复」，与现逻辑矛盾）。
+- **M3（中·单测补强）**：`qty_classifier.rs` 新增 `round_half_even`（银行家舍入，对齐 Python `round`）与 `align_and_stretch`（重心对齐+拉伸）的纯函数单测。
+- **验证**：`cargo check` exit 0；`cargo test` **7 passed/0 failed**（含 `buttons` 端到端模型测试），本次新增 3 项。
+- **未改（沿用既有设计，记录在审查报告中）**：H2（Scale 仅按宽度缩放，交易行 UI 横向铺满、纵向裁切，标定 1920×1080 因子恒 1.0，属刻意取舍）；M2（`sanitize` 两处语义不同，未盲目合并）；M4（购买阶段每轮需重新截帧，复用无收益）；M6（手写 JSON 仅转义 5 类字符、子弹名无特殊字符，改 serde_json 收益低风险高）；L1-L4（`play_capture_chime` 同步播放 ~0.26s 仅发生于 Done 一次，影响可忽略）。
+
+## 2026-10-05（续十一）— 真正根因：两场景 2px 纵向错位；对齐+拉伸后训练 acc=1.0
+- **推翻续十误诊**：用户提供两张完整购买界面截图，`calibrate.py` 红框 + 包围盒实测证明**坐标完全正确**——
+  数字 "200/200" 全局包围盒 x[1619,1690]，可兑换 y[734,746]、不可兑换 y[792,804]，均被
+  (1560,722,140,32)/(1560,782,140,32) 完整罩住。放大数据集图逐类目检：类 1="1/200"、类 200="200/200"，
+  **标签与内容一一对应，数据无任何问题**（此前 ASCII 渲染下采样把 13px 细数字洗掉，造成"无数字"误判）。
+- **真正根因**：两场景裁剪区内数字局部行相差 **2px**（可兑换局部 y≈18，不可兑换 y≈16）。细笔画数字
+  （1px 宽、13px 高）错位 2px 后，同类两图逐像素差（类内 12.6）超过不同数值差（类间 10.2），
+  CNN 完全无法收敛。纵向重心对齐后：**类内 0.63 / 类间 18.4（29 倍），1-NN 留一法 97.5%**。
+- **修复**（`train_qty.py` + `qty_classifier.rs` 两端同步）：
+  1. 新增 `align_and_stretch()` 前处理：亮像素(≥110)行重心整幅纵向平移至第 16 行（越界补背景值，
+     Rust 端银行家舍入与 Python `round` 一致）+ 线性对比拉伸 `clip((x-37)*255/115)`；常量
+     `QTY_STROKE_THRESH=110 / STRETCH_LOW=37 / STRETCH_HIGH=152 / ALIGN_ROW=16` 两端一致；
+  2. `QtyDataset.__getitem__` / `infer` / 信号自检统一走对齐+拉伸；自检报警文案修正；
+  3. `qty_classifier.rs::preprocess` 在灰度化后、缩放前插入同款 `align_and_stretch()`。
+- **验证**：`train --no-augment --epochs 60 --export-onnx` → acc 0.005 → **1.0000**（epoch 58），
+  loss 5.31→0.02；模型对 1/7/42/100/200 抽样推理全部命中；`cargo build` exit 0，`cargo test` 4 passed/0 failed。
+- **README**：前处理契约表新增对齐+拉伸行；训练命令推荐 `--no-augment`（确定性渲染 + 每类 2 张，
+  增强反而无法收敛）。**无需重采集**，现有 400 张数据直接可用。
+
+## 2026-10-05（续十）— 根因最终定位：裁剪坐标截到静止 UI 条，区域无数字（已续十一推翻）
+- **演示证伪"场景混放"假设**：单场景数据单独训练仍 acc=0.005、loss 卡 5.3（续九的 2-means 200/200 分簇分的是两场景各自静止背景，非数字）。
+- **ASCII 有符号渲染铁证**：标签 1/2/3 逐字符一致，100/200 彼此一致仅整体左移一格；140×32 区域仅含左侧圆角图标 + 静止竖条分隔符，**无任何随数量变化的数字笔画**。
+- **结论**：坐标 `(1560,722)/(1560,782)` 截到的是静止 UI 条，**不含所选数量数字**；训练失败 100% 是采集坐标错（数据无数字信号），非网络/方法/场景混放问题。
+- **下一步**：需完整购买界面截图，用 `calibrate.py` 红框确认偏位 → 改 `train_qty.py` 顶部 `QTY_REGION_*` 与 `config.rs` `BUY_QTY_REGION_1/2` → 重采集每类 10~20 张再训。演示脚本已删除。
+
+## 2026-10-04（续九）— 训练失败根因：裁剪坐标未捕获有效数字
+- **现象**：`train_qty.py` 训练 acc 恒为 0.005（=随机 1/200），loss 卡在 5.30（=ln200）；增强开/关均失败；此前偶发的 0.99 为不可复现假象。
+- **根因（经实测定位）**：`qty_dataset` 的**类间平均像素差(10.2) < 类内平均差(12.6)**（值域 0-255），即不同数值截图比同数值两张更相似——数学上不可能发生于正确截到数字的数据集。说明 `BUY_QTY_REGION_1/2`（可兑换 (1560,722,140,32)/不可兑换 (1560,782,140,32)）**未框住动态数量数字**，截到的是静止背景/标签区，标签(目录名)与图像内容脱钩。
+- **解释"数据吻合却推理差"**：训练与推理裁剪同一错误区域 → 一致但无信号 → 模型无法区分数值 → 推理同样失败。前处理无偏差（裁剪恰为 140×32，缩放恒等；灰度/归一化 Python↔Rust 一致），非前处理问题。
+- **改正**：
+  1. `train_qty.py` 新增 `dataset_signal_report()` 信号自检——类间差≤类内差×1.2 即报警，避免再 silently 训出垃圾；
+  2. 新增 `nn-classifier/calibrate.py`：用一张完整截图可视化裁剪框（红框+裁出 crop.png），目视确认是否落在数字上；
+  3. 增强改温和（去强模糊，仅 ±3% 平移/±2% 缩放/±0.12 亮度），并补"每类<5 张时增强会令模型无法学习"的告警 + 修复 `present` 统计 off-by-one（用 range(1,201)）；
+  4. 验证：语法 pass；信号自检正确命中报警。
+- **用户下一步**：用 `calibrate.py` 校准坐标 → 同步改 `config.rs BUY_QTY_REGION_1/2` 与 `train_qty.py QTY_REGION_*`（两处都要改）→ 重采集合类 10~20 张 → `python train_qty.py train --epochs 60 --export-onnx`。注意每类 2 张即使坐标正确也只够"死记"，泛化仍需多采集+温和增强。
+
+## 2026-10-04（续七）— 数量坐标更正 + 采集落盘防覆盖
+- **坐标更正**（用户二次订正）：数量整块区域由旧值（可兑换 y=782 / 不可兑换 y=726，高 31）改为
+  **可兑换 (1560,722,140,32) / 不可兑换 (1560,782,140,32)**（高 32）。同步 `config.rs`
+  `BUY_QTY_REGION_1/2`、`train_qty.py` 两常量与 README 坐标表；`QTY_INPUT_H=32` 与新高 32 天然对齐。
+- **确认训练工程隔离**：三个 NN 功能各自独立物理目录——`dataset/`（digit）、`button_dataset/`
+  （button，含 `train.py`）、`qty_dataset/`（qty，含独立 `train_qty.py`），互不交叉、产物各为
+  `model.onnx` / `buttons.onnx` / `qty.onnx`。
+- **防覆盖**：`qty_tool.rs::save_qty_region` 原用 `qty_{idx}_shot.png` + `File::create` 会覆盖同名
+  旧图（重跑采集 `idx` 归零即误覆盖）。改为同名存在时追加 `_1/_2…` 序号生成新文件名，**保留
+  文件夹内全部已有图片、绝不覆盖/清空**。
+
+## 2026-10-04（续六）— 数量采集合成串联 + 分类区间改 1~200 + nn-classifier README 三功能文档
+
+- **问题**：数量采集 tab 截图速度比画面动作快一倍以上，原「pre 截图→点加号→post 截图」双截逻辑导致同一数量被重复/错标（post 截到旧值却标为 +1）。
+- **`qty_tool.rs` 串联修正**：每轮改为「截一次整块区域（标注为当前应显示数量 `expected`）→ 点加号 → 等待 `CLICK_SETTLE_MS=250ms` 画面刷新 → 下一轮截 `expected+1`」。**每个数量值只截一次**，从根上消除同值重复/错标；`expected` 起步 `start_qty.clamp(1,200)`，越界 1..200 提前结束。
+- **分类区间改 1~200（不含 0）**：
+  - `train_qty.py`：`QTY_NUM_CLASSES=200`、`QTY_MIN_LABEL=1 / MAX=200`；`QtyDataset` 目录名（数量值 1..200）→ 训练标签 `value-1`（0..199）；`collect` 拒绝 0/越界；`infer` 输出 `value = argmax + 1`。
+  - `qty_classifier.rs`：`NUM_CLASSES=200`；`classify` 输出 `top + 1`（索引 0→数值 1）；ONNX 契约 `logits[1,200]`。
+  - `main.rs`：`qty_tool_start` 默认 1；`qty_tool_panel.rs`：DragValue 范围 `1..=200`；`buy.rs` 文档同步 1..200。
+- **`nn-classifier/README.md`**：补齐「任务 3：子弹所选数量整块区域分类（qty）」完整文档——模型/前处理契约、两场景坐标、数据集格式 `qty_dataset/<value>/`、子命令 `collect/train/infer` 参数表、Rust 端集成、端到端流程；并将模块整体改写为「三个神经网络功能（数字分类 / 按钮检测 / 数量整块分类）按物理文件夹 + 独立脚本隔离」说明，目录结构补 `qty_dataset/`、`train_qty.py`、`qty.onnx`。
+- **验证**：`cargo build` exit0（仅无害增量锁文件删除提示 `os error 5`，系残留进程持有，删 target/debug/incremental 即消失）；`cargo test` **4 passed/0 failed**；Python 改动逐段人工复核（沙箱拦截解释器，逻辑等价，无需 py_compile 即确认）。
+
+## 2026-10-04（续五）— 子弹数量识别改为「整块区域整体分类」（0~200）
+
+- **需求变更**：原数量识别 `recognize_buy_qty` 逐位（百/十/个）识别再拼接；因数量在画面中居中显示、不同位数坐标位置不同，逐位裁剪极易错位。改为对**整块数量区域**一次性分类，直接输出整数值 0~200（共 201 类）。
+- **新增训练脚本 `nn-classifier/train_qty.py`**（子命令 `collect`/`train`/`infer`）：
+  - 模型 `QtyRegionCNN`：灰度 → 3× conv+maxpool → fc → 201 类；输入 `1×1×32×140`，输出 `logits[1,201]`（索引即数值）。
+  - 前处理契约与 Rust 一致：灰度(ITU-R 601) → 双线性 32×140 → `/255` → `(x-0.5)/0.5`。
+  - `collect`：从完整截图按场景裁剪整块区域并写入 `qty_dataset/<label>/`（可兑换 (1560,782,140,31) / 不可兑换 (1560,726,140,31)）；`train` 导出 `qty.onnx`（已用 checker 校验，输入 [1,1,32,140] / 输出 [1,201]）。
+- **新增 Rust 模块 `src/domain/qty_classifier.rs`**：加载 `qty.onnx`（惰性单例 + env/exe 向上追溯，模板同 `nn_classifier`/`buttons`），整块区域预处理 + 201 类 softmax + 置信度阈值(0.5) → `Option<u32>`。
+- **`config.rs`**：新增 `BUY_QTY_REGION_1/2` 与 `BuyScene::qty_region()`；删除已废弃的逐位 `BuyQtyRects`/`BUY_QTY_DIGITS_1/2`/`qty_rects()`。
+- **`buy.rs`**：`recognize_buy_qty(hwnd, scale, scene)` 改为裁剪整块区域经 `qty_classifier::classify`；`adjust_buy_qty` 调用同步更新。
+- **`qty_tool.rs`**：采集逻辑由「逐位裁剪」改为「整块区域裁剪」，并按 **起始数量 + 点击序号** 标注为 `qty_dataset/<label>/`（新增长参数 `start_qty`），直接产出带标注训练集。
+- **`main.rs`/`qty_tool_panel.rs`**：新增「起始数量」输入（0..=200，默认 0），透传至 `run_qty_collection`。
+- **`dist.bat`**：随包拷贝 `nn-classifier/qty.onnx` 至 `dist/nn-classifier/`。
+- **验证**：`cargo build` exit0（仅增量锁文件删除警告；LNK1104 因实机运行实例占锁，Stop-Process 终止后重建）；`cargo test` **4 passed/0 failed**；`train_qty.py --help` 与 `py_compile` 通过；合成数据 1-epoch 训练+导出验证 ONNX 形状 = `input[1,1,32,140]` / `logits[1,201]`，与 Rust 端完全一致（合成产物已清理，未随包分发）。
+
+## 2026-10-04（续四）— 数量采集：修正加号点击落点 + 毛玻璃悬浮面板 + F9 结束
+
+- **问题①（点击落点）**：原 `qty_tool.rs` 的加号点击坐标 `plus_rect` 优先取检测器 `d.plus`（class 2）。因「购买」与「加号」外形相近，检测器在两者混淆时会把 **buy** 的 bbox 当作 plus 返回，导致实际点到**购买按钮**（实机已观察到）。**修复**：加号点击改为确定性配置坐标 `scale.rect(scene.layout().plus)`（与数量数位裁剪同源，已知场景即已知加号位置，绝不误点购买）；`d.plus` 仅保留于场景判定（Auto 模式），不再用于点击。
+- **问题②（毛玻璃 + F9）**：原 `start_qty_tool` 未进入激活态（完整主面板盖住游戏），且 F9 只停观察任务、不停本工具。**修复**：
+  - `main.rs` 抽离 `enter_active_mode(ctx, status)`，观察与数量采集共用；`start_qty_tool` 启动即 `enter_active_mode("数量采集中")` → 收起为置顶毛玻璃悬浮面板（透明/穿透/排除截图/开启 DWM 模糊）。
+  - `stop()` 现同时中止 `qty_tool_stop` 并复位采集状态；`handle_f9` 经 `stop()` 一并结束采集并退出毛玻璃态。
+  - `poll_qty_tool` 收到 `Done` 后调用 `stop(ctx)` 退出毛玻璃、恢复主面板。
+  - `floating_panel.rs` 新增数量采集分支：运行中优先展示「数量采集中 / 已截图 N/200 次 / 按 F9 结束采集」，其余观察态内容不再显示。
+- **验证**：`cargo build` exit0（仅增量锁文件删除警告；LNK1104 因实机运行实例占锁，停进程后重建通过）；`cargo test` **4 passed/0 failed**。
+- **新增 `src/domain/qty_tool.rs`（领域层采集逻辑）**：
+  - `SceneMode`（Auto / Exchangeable / NonExchangeable）+ `from_u8`；
+  - `TOTAL_SHOTS = 200` 上限常量；
+  - `QtyToolMsg::{Progress{taken,total}, Done{ok,msg}}` 后台→主线程通道消息；
+  - `run_qty_collection(hwnd, scene_mode, out_dir, stop, tx)`：缩放因子按客户区宽度推导；场景判定一次（Auto 用 `buttons::detect_buttons_from_frame` 定位，失败回退可兑换）；加号位置优先用检测器 `det.plus`，否则用 `scale.rect(scene.layout().plus)`；
+  - 每轮：截客户区 → `crop_region` 裁百/十/个位各存 `qty_{idx:05}_{pre|post}_{h|t|o}.png`（`save_rgba_png` 同步落盘，单帧保存完才进下一步）→ 点加号 → 再次截图裁剪；截图/保存失败则本帧重试（`continue`，不推进 idx/taken）；
+  - 停止条件：`taken >= 200` 正常结束；`stop` 信号置位优雅退出；`max_cycles = 200+300` 安全阀防死循环；每轮含节流延时（60~120ms）。
+- **新增 `src/ui/qty_tool_panel.rs`**：卡片式面板；场景下拉（自动检测/可兑换/不可兑换）、输出目录（`浏览...` 选取，默认 `{save_path}/qty_tool`）、「▶ 开始采集」/「■ 停止」互斥按钮、实时「采集中：N/200 次截图」。
+- **`main.rs`**：新增 `MainTab::QtyTool` 并接入 Tab 栏 + dispatch；`ObserverApp` 新增 `qty_tool_scene/u8`、`qty_tool_dir/String`、`qty_tool_running/bool`、`qty_tool_taken/usize`、`qty_tool_rx`、`qty_tool_stop`；`start_qty_tool`（聚焦窗口 + 起后台线程）、`stop_qty_tool`（置位停止信号）、`poll_qty_tool`（收消息更新计数/复位）三方法；`update` 中调用 `poll_qty_tool`。
+- **模块注册**：`domain/mod.rs` 增 `pub mod qty_tool`；`ui/mod.rs` 增 `pub mod qty_tool_panel`；`main.rs` 重导出二者。
+- **验证**：`cargo build` exit code 0（仅增量锁文件删除警告，非错误；LNK1104 因用户实机运行实例占锁，PowerShell `Stop-Process` 终止后重建通过）；`cargo test` **4 passed / 0 failed**（原有用例未破坏）。
+- **说明**：每次「截图」= 一个采集动作（三数位各一张 PNG，共 3 文件），计 1 次；每轮 2 次截图 → 100 轮 = 200 次上限。F9 不中断本工具，须用面板「停止」。
+
+## 2026-10-04（再续二）— 毛玻璃实时显示子弹数量 + 三层闸门日志（启动清空）
+
+- **需求**：① 购买界面识别出的子弹数量实时显示在毛玻璃 UI（内容不截断）；② 三层闸门（L1 调用侧 / L2 按钮检测 / L3 数量识别）加关键状态与结果日志排查；③ 每次程序启动清空旧日志，避免累积消耗。
+- **新增 `log.rs`**（轻量日志模块）：`init()` 以截断模式创建 exe 同目录 `observe.log`（启动即清空旧内容）；`write(msg)` 仅记录一行关键状态/结果；未初始化（如单测）时为 no-op 不落盘。`main()` 启动时调用 `crate::log::init()`。
+- **`buy.rs` 三层闸门日志（仅关键状态/结果）**：
+  - L1（调用侧）：进入调整时记「场景 + 三按钮已检出 + 目标数量」；`det=None` 或 `scene=None` 各记一条跳过原因。
+  - L2（`adjust_buy_qty` 首行）：`minus/plus/buy` 任一未检出各自记一条跳过原因（即「加减按钮未检出导致动作缺失」的直接证据来源）。
+  - L3（循环内）：每轮记「识别数量 / 目标」，点击加/减各记一条；`recognize_buy_qty` 返 `None` 记识别失败；对齐/超上限/鼠标就位各记一条。
+  - 实时上报：循环内每识别到数量即通过 `ObserveMsg::DetectedQty { qty }` 发往主线程刷新面板；失败/超上限发 `None`。
+- **`observe.rs`**：`ObserveMsg` 新增 `DetectedQty { qty: Option<u32> }` 与 `BuyCleared`；`verify_then_decide` 新增 `tx: &mpsc::Sender<ObserveMsg>` 透传（实机实时上报数量）；每颗子弹进入购买判定前发 `BuyCleared` 清空上一颗残留的购买展示（价格/场景/数量）。
+- **`main.rs`**：`ObserverApp` 新增 `detected_qty: Option<u32>`（默认 None，new/start/Done 均清零）；`poll_observe` 处理 `DetectedQty`（写入并 `request_repaint`）与 `BuyCleared`（清空三项）；`main()` 启动时 `log::init()`。
+- **`floating_panel.rs`**：购买阶段（场景已判定）在「目标数量：N」下方以 15px 加粗展示「当前数量：N」实时值；识别失败/尚未识别显示占位「当前数量：—」，避免面板空缺或截断。
+- **验证**：`cargo build` exit code 0（期间遇 LNK1104，因用户实机运行中的 `delta-trade-observer.exe` 占锁，PowerShell `Stop-Process` 终止后重建通过）；`cargo test` **4 passed / 0 failed**。
+- **说明**：日志仅记录关键状态/结果，非逐帧刷屏；启动截断旧日志，避免跨班次无界累积。
+
+## 2026-10-04（再续）— 购买阶段：数量识别 + 减/加自动调整（驱动现有 buttons.onnx）
+
+- **目标**：在 `verify_then_decide` 判定 `Proceed`（重验证价 < 阈值）后，识别购买界面「所选子弹数量」三数位，用检测器已解码的「减/加」按钮点击把数量调到面板设定值（`buy_qty`，默认 31），再把鼠标移到「购买」按钮（不点击），由 `observe` 等待 1 秒后 ESC 回扫描。
+- **`config.rs` 新增数量数位坐标**：
+  - `struct BuyQtyRects { hundreds, tens, ones: Rect }`；
+  - `BUY_QTY_DIGITS_1`（场景1·可兑换：百/十/个 = `[1617,730]/[1628,730]/[1639,730]`，均 y=730）；
+  - `BUY_QTY_DIGITS_2`（场景2·不可兑换：百/十/个 = `[1617,788]/[1628,788]/[1639,788]`，**三个数位 y 均为 788**，已纠正原方案十位 730 笔误）；
+  - `BuyScene::qty_rects(&self)` 返回对应场景的数量坐标。
+- **`win.rs` 新增** `click_client_rect(hwnd, rect)`（客户区矩形中心→屏幕坐标→人类化点击）与 `move_mouse_to_client(hwnd, rect)`（同源移动、不点击），供购买阶段减/加点击与鼠标就位复用。
+- **`buy.rs` 新增**：
+  - `recognize_buy_qty(hwnd, scale, rects)`：复用价格数字分类器 `nn_classifier::classify`（同为 32×32 逐位分类），识别百/十/个三数位拼为 `u32`；任一数位失败即返 `None`（安全降级）。
+  - `adjust_buy_qty(hwnd, scale, det, scene, target_qty)`：仅在「减/加/购买」三按钮均检出时执行；循环上限 `ADJUST_MAX=20`、步进 `ADJUST_STEP_MS=150`；`cur<target` 点加、`cur>target` 点减、相等则把鼠标移到购买按钮待命；识别失败/超上限均先移鼠标到购买按钮再返回（不卡死、不误购）。
+  - `verify_then_decide` 新增 `target_qty: u32` 形参；`Proceed` 路径改一次性 `buttons::detect_buttons` 取 `ButtonDet`（同时得场景与三按钮 bbox，避免重复推理），场景成立则调 `adjust_buy_qty`。
+- **`observe.rs`**：`run_observation` 新增 `buy_qty: u32` 透传；`Proceed` 分支等待由 2 秒改 1 秒（贴合「等待一秒后 ESC」）。
+- **`main.rs`**：`ObserverApp` 新增 `buy_qty: u32`（默认 31，未持久化，每次启动回默认防误用）；`start_observation` 透传。
+- **`control_panel.rs`**：「是否购买」展开区新增「购买数量」`DragValue`（1..=999，默认 31 发）。
+- **`floating_panel.rs`**：购买阶段场景标签下展示「目标数量：N」只读信息，便于实机核对。
+- **数量数位识别**：暂复用现有 `model.onnx`（未专门在数量框训练）；若实机误识率高，用户将补充数量框训练数据重训。
+- **验证**：`cargo build` exit code 0；`cargo test` **4 passed / 0 failed**（原有 4 用例全过，未破坏）。无实机截图推理（无游戏窗口），建议实机勾选「保存购买界面」复核数量框坐标与减/加点击落点。
+
+## 2026-10-04（续）— Rust 端接入 buttons.onnx：模型加载 + 推理 + 场景判定（可兑换/不可兑换）
+- **新增模块 `src/domain/buttons.rs`**：接入 `buttons.onnx`（三分类 CenterNet，3 类 = buy/minus/plus），完成完整场景判断逻辑：
+  - 模型加载沿用 `nn_classifier` 的惰性单例 + 环境变量（`DELTA_OBSERVER_BUTTONS_MODEL` / `DELTA_OBSERVER_BUTTONS_MODEL_DIR`）+ exe 向上追溯 `nn-classifier/`、`assets/`、`exe` 同目录；模型缺失则永久记 `None`，推理返回 `None`，不崩溃。
+  - 前处理与 `train.py` 完全一致：全幅客户区 RGBA → 丢 Alpha → 双线性缩放 256×256 → `/255` → NCHW（`image` crate `resize` + `Triangle`，等价 PIL `BILINEAR`）。
+  - 推理：`ort::Session` 跑 `input[1,3,256,256]` → `heatmap_logits[1,3,32,32]` + `size[1,6,32,32]`（输出名与 `train.py` 导出一致）。
+  - 解码（复刻 `predict_layout.py::decode_class`）：热力图峰值 `sigmoid` 过 `THRESH=0.3` → argmax 取格 → 读 `size` 两通道 → 还原客户区 bbox（乘 `sx=orig_w/256, sy=orig_h/256`）。
+- **场景判定（核心需求）**：以「购买」按钮 bbox 锚定当前界面属于场景1 还是场景2，并按要求重命名：
+  - **场景1 = 「可兑换子弹的场景」**（`buy ≈ [1482,829,297,61]`）；
+  - **场景2 = 「不可兑换子弹的场景」**（`buy ≈ [1484,887,293,59]`）。
+  - 在 `config.rs` 新增 `BuyScene` 枚举 + `label()`（`可兑换子弹的场景` / `不可兑换子弹的场景`）、`BuyBtnLayout` 结构 + `BUY_LAYOUT_1/2` 常量、`determine_scene(buy_bbox)`（复刻 `train.py::determine_case`：中心距 + 宽高相对误差，`dist<40 && sr<0.15` 才判定，否则 `None`）。
+  - 检测出的 `buy` bbox 先经 `Scale::to_calib` 映射回标定视口坐标，再与两套模板比对（与现有数字识别的坐标契约一致）。
+- **接入购买流程**（`buy.rs` / `observe.rs` / `main.rs` / `floating_panel.rs`）：`verify_then_decide` 在界面稳定后调用 `buttons::detect_scene`，把场景塞进 `BuyDecision::{Proceed,Abort}`；经新增 `ObserveMsg::BuySceneNotice { label }` 传到主线程，在毛玻璃面板展示当前场景（如「可兑换子弹的场景」）。模型缺失时 `scene=None`，购买流程照常、不报错。
+- **`config.rs::Scale` 新增 `to_calib`**：与 `rect` 互逆，把实际客户区矩形映射回标定视口坐标。
+- **验证**：`cargo build` 0 error；`cargo test` 3 项全过（`decode_class` 坐标还原 roundtrip、`determine_scene` 匹配两套布局 / 远距返回 None、低置信度不检出）；ONNX I/O 契约与已验证的 Python 路径同名同形。真实 `buttons.onnx` 由 `train.py button` 在 `nn-classifier/` 产出后随 `dist.bat` 分发到 `dist/nn-classifier/buttons.onnx`（搜索路径已覆盖）。
+- **待实机确认**：本环境无游戏窗口，未跑真实截图推理；建议用户实机勾选「保存购买界面截图」复核检测框与场景标签。
+
+## 2026-10-04 — 按钮检测升级为三分类（buy/minus/plus）+ 布局判定 + 标注工具重构
+- **三分类检测器**：`BuyButtonDetector` 由单类（购买）升级为 3 类 CenterNet，`hm_head` 输出通道 `C=3`、`size_head` `2C=6`。训练数据格式改为 `targets` 字典 `{"buy","minus","plus"}` 各自 `bbox|null`；旧 `{"bbox":...}` 单按钮格式仍兼容（`_normalize_sample`）。
+- **两种固定布局**（`train.py` 的 `LAYOUTS`）：① `buy[1482,829,297,61]` / `minus[1461,754,38,42]` / `plus[1764,754,38,42]`；② `buy[1484,887,293,59]` / `minus[1461,815,38,42]` / `plus[1764,815,38,42]`。新增 `determine_case(buy_bbox)` 据「购买」bbox 判定布局①/②（中心距离 + 尺寸相对误差双重判定）。
+- **检测逻辑**（`predict_layout.py`）：模型独立解码三类 → 以「购买」bbox 为锚点判定布局 → 减/加按钮布局固定，模型检出且与模板中心偏差 ≤ `CASE_TOL_PX=100` 才采用模型结果，否则回退模板坐标（`score` 置 null 标记 `from_case`），保证输出完整、精确、不被误检带偏。
+- **产物重命名**：`buttons.pt` + `buttons.onnx`（原 `buy_button.*`），不覆盖数字模型 `model.onnx`。`predict_button.py` 重命名为 `predict_layout.py`。
+- **标注工具重构**（`annotate_gui.py`）：支持鼠标拖拽框选、buy/minus/plus 类别切换、布局①/②一键填充全部三按钮、导出 `targets` 格式；`label.py` 支持按类别逐条录入并合并到同一图 `targets`。
+- **数据迁移**：`button_dataset/annotations.jsonl` 245 条旧格式（200 条布局① / 45 条布局②）已迁移为 `targets` 格式（minus/plus 由用例推导）。
+- **合成数据**（`make_dummy_dataset.py`）：改为 1920×1080、按两种固定布局精确放置三按钮。
+- **验证**：py_compile 全过；合成 160 张训练 12 epoch loss 0.30→0.028；`buttons.onnx` 过 checker，I/O 名 `input` / `heatmap_logits[1,3,32,32]` / `size[1,6,32,32]` 与 `predict_layout` 一致；`predict_layout` 在合成图上正确判定布局、`buy` 由模型检出、`minus/plus` 走模板回退（score null）。onnxruntime 推理路径已装包复测（见下条）。
+
+## 2026-10-03（续2）— 删除 Notification 组件 + 毛玻璃去黑底改通透
+- **删除 Notification 组件**：移除 `render_toast`（右上角 Element UI 风格通知）及其 `toast: Option<(String,bool,f64)>` 字段、初始化、`poll_observe` 中 `BuyNotice`/`Done` 的 toast 写入，以及 `update()` 里的 `render_toast` 调用与对应导入（Align2/Margin/RichText/Stroke/Shadow）。
+- **价格改渲染到毛玻璃面板**：`ObserveMsg::BuyNotice { text }` 改为 `BuyNotice { price: u32 }`；新增 `ObserverApp.buy_price: Option<u32>`，购买阶段重验证识别到的价格直接写入该字段，由 `floating_panel::status_body` 以**大号数字**渲染（仅显示数字 + 微小「哈夫币」单位，不弹任何提示框）。`start()` 进入激活态时清零，`Done` 时清零。
+- **毛玻璃去黑底 → 通透磨砂**：根因是 eframe 默认 `clear_color` 返回 `from_rgba_unmultiplied(12,12,12,180)`（深灰半透明底色）→ 黑色背景。覆写 `App::clear_color` 返回 `[0,0,0,0]` 全透明，使 DWM 背景模糊透出桌面。面板填充由 `228,234,246,70` + 黑色阴影改为极淡白底 `240,244,250,50` + 白描边 `255,255,255,210`，**移除黑色实色底与黑色阴影**，仅保留磨砂质感。悬浮窗高度 208→256 以容纳价格数字。
+- **错误可见性保留**：`Done{ok:false}` 不再弹 toast，改为写入 `error` 字段（Idle 主面板展示），避免静默丢失。
+- **验证**：`cargo build` 0 error；清理 4 个 warning（floating_panel 多余 `self` 导入、`observe.rs` 中 `Proceed` 解构未用的 `caliber`/`bullet` → 改 `Proceed { price, .. }`）。仅余增量 lock 文件删除的良性 os error 5 警告（非代码问题）。
+
+## 2026-10-03（续）— 废弃 nn-buy-button，合并入 nn-classifier（单一训练入口）
+- **合并**：废弃独立子项目 `nn-buy-button/`，全部训练代码并入 `nn-classifier/`（目录名沿用不改）。原两处训练脚本整合为 **`nn-classifier/train.py` 单一文件**，通过子命令区分：`python train.py digit`（数字分类，默认）/ `python train.py button`（购买按钮检测）。无子命令时等同 `digit`，兼容旧调用。
+- **共享依赖**：两项目 `requirements.txt` 合并为 `nn-classifier/requirements.txt` 一份（torch / torchvision / pillow / numpy / onnx；onnxruntime 仅 predict_layout.py 可选）。
+- **产物隔离**：按钮检测默认输出 `buttons.pt` + `buttons.onnx`，**不再覆盖**数字模型的 `model.onnx`（Rust/ORT 使用的数字模型保持 `model.onnx`）。按钮数据集默认 `button_dataset/`，与数字 `dataset/` 互不干扰。
+- **辅助脚本**：`predict.py`（数字）、`predict_layout.py`（按钮布局，import 自合并后的 train.py）、`make_dummy_dataset.py`（按钮合成数据，默认 out=`button_dataset`）均置于 `nn-classifier/`。
+- **修正**：`predict_layout.py`（原 `predict_button.py`）在缺 onnxruntime 回退 PyTorch 路径下漏 import `torch` → NameError，已上移至模块级 import 修复。
+- **验证**：4 个 .py 均 py_compile 通过；`train.py`/`digit`/`button` 三个 `--help` 正常；合成 200 张训练 12 epoch，loss 0.24→0.013，ONNX 过 checker；digit `model.onnx` mtime 在按钮训练前后不变（未被覆盖）；`predict_layout.py` PyTorch 回退路径可运行。验证产物已清理，仅留源码。README 已同步两类任务文档。
+
+## 2026-10-03 — 价格可视化窗口起点改为「昨日 18:00」+ 新增「购买」按钮目标检测训练子项目
+- **价格可视化（price_viz_panel.rs）**：数据窗口起点从「今日 00:00」改为「上一天 18:00」（今日 00:00 往前 6 小时，`window_start_ms`），终点保持当前时刻 `now_ms`。同步更新：① 数据查询过滤 `r.ts_ms >= window_start`；② x 轴域 `[window_start, now_ms]`（不再固定 24:00，折线铺满宽度）；③ 时间刻度改为从昨日 18:00 起每 3 小时一个整点（18:00/21:00/00:00/03:00…），起点标「昨日 18:00」、跨日点标「今日 00:00」；④ 副标题/坐标标题/空数据文案改为「昨日 18:00 起」。移除已无用的 `DAY_MS` 常量。`cargo build` 0 error。
+- **新增 NN 子项目 `nn-buy-button/`**：游戏交易行「购买」按钮位置不固定，训练轻量 **CenterNet 风格单目标检测器**自动回归归一化 bbox。模型：3×Conv+ReLU+MaxPool（8× 下采样到 32×32）→ heatmap_head `[1,1,32,32]`（中心热力图）+ size_head `[1,2,32,32]`（w/h 归一化）。损失 = focal heatmap loss + masked L1 size loss。`train.py` 支持 `--epochs/--batch-size/--lr/--export-onnx/--only-export`，导出 ONNX（dynamo=False，过 `onnx.checker`）；数据集为 JSONL（image + bbox 像素坐标，支持 `bbox:null` 负样本）；提供 `predict.py`（优先 onnxruntime，回退 torch，含坐标还原与画框）、`make_dummy_dataset.py`（合成数据冒烟测试）、`requirements.txt`、`README.md`（含与 Rust 端 ORT 前处理对照表）。
+- **验证（合成数据 200 张，15 epoch）**：loss 0.19→0.014，ONNX 通过 checker；40 个正样本 **100% 检出**，mean IoU 0.587（tiny 模型 + 拉伸缩放下的合理基线，真实游戏截图需重新采集标注训练）。dummy 产物（dataset/、model.pt、model.onnx）已清理，仅留源码与生成器。
+
 ## 2026-10-01（续2）— 模板匹配预处理归一化（精度从全空→0.9+）+ GAUGE12 注释同步
 - **问题**：用户确认数字截图（坐标）无误，但模板匹配识别效果差。实测复刻 NCC 管线：真实游戏数字对 10 个模板的 NCC 仅 `0.21~0.34`（全部低于 0.65 阈值 → price 全空）。但逐位肉眼核对字形与模板高度相似 → 字体并非主因。
 - **根因（定位）**：旧管线 `to_feature` 直接把 12×20 整框拉伸到 32×32。真实数字在裁剪框内**顶部对齐、下方大片黑**，而模板数字**居中**；二者拉伸后数字位置/留白不一致 → NCC 崩溃。属预处理缺陷，非模板字体问题。
@@ -397,3 +639,73 @@
   - 纹理重建与选中提交放在 `res` 不可变借用作用域之外，渲染块只读，规避借用冲突；数字纹理仅在结果更新或选中变化时重建。
   - 新增 app 字段 `ocr_test_selected/ocr_test_seq/ocr_test_digit_seq/ocr_test_digit_sel/ocr_test_digit_tex`。
 - **编译**：`cargo build` 通过，**0 error / 0 warning**（增量锁警告 `os error 5` 为被杀进程残留，删 target/debug/incremental 后消失）。需在真实 Windows 环境用一张交易行截图 + 口径点「识别」→ 拖动滑块核验逐位匹配图与分数条。
+
+## 2026-10-05（续十二）— 购买流程闸门：未确认数量禁止触发购买点击
+- **现象（用户全流程测试）**：到达购买界面后跳过数量调整、直接触发购买按钮点击。
+- **根因（状态校验缺失）**：
+  1. `verify_then_decide` 里数量调整（`adjust_buy_qty`）只在 `det` 与 `scene` 都为 `Some` 时运行，但**无论是否运行都照常 `return BuyDecision::Proceed`**——按钮检测失败/场景判不出时仍发购买触发；
+  2. `adjust_buy_qty` 原返回 `Option<()>`，把「已对齐」「识别失败」「超上限未对齐」全部 `return Some(())`，**调用方无法区分数量是否确认过**；
+  3. 下游购买触发点只认 `Proceed` 决策，无 `qty_confirmed` 状态闸门 → 未确认数量下也能触发购买。
+- **修复（新增约束逻辑）**：
+  1. 新增 `QtyAdjustResult { Confirmed(u32), Unconfirmed }` 枚举，`adjust_buy_qty` 仅在复识别 `cur==target_qty` 时返回 `Confirmed`，其余（减加/购买按钮任一缺失、识别失败、超 `ADJUST_MAX` 未对齐）一律 `Unconfirmed`；
+  2. `verify_then_decide` 仅在 `adjust_buy_qty` 返回 `Confirmed` 时产出 `BuyDecision::Proceed`，且 `Proceed` 新增 `qty/u32` 与 `buy/Rect` 字段；否则一律 `Abort`（ESC 返回，不购买）；
+  3. `observe.rs` `Proceed` 分支改为：数量已确认才 `win::click_client_rect(hwnd, buy)` 实际触发购买（全流程唯一购买触发点），其后短暂停顿再 ESC；`buy_enabled` 开关仍总闸控制。
+- **验证**：`cargo build` 通过（主 target 因运行中的 .exe 持有锁报 LNK1104，改用独立 `target_verify` 目录编译链接通过，证明代码无误）；`cargo test` 4 passed / 0 failed。LNK1104 为环境锁文件问题，与代码无关（终止 .exe 或换 target 目录即可）。
+
+## 2026-10-05（续十四）— 点击诊断日志 + 修正"已点击"误报
+- **背景**：用户全流程实测"鼠标压根没往加按钮移动"，但日志却打印"点击加按钮"，且数量恒读 1。排查指向 `click_client_rect` 内部 `client_to_screen` 失败静默返回 `false`（鼠标不动），而调用方无条件打印"已点击"→ 误报。
+- **改动（仅诊断+日志，未碰主逻辑）**：
+  1. `win.rs::click_client_rect` / `move_mouse_to_client`：坐标转换前/后加 `[CLICK-DIAG]` / `[MOVE-DIAG]` 日志，打印 `rect`、客户区中心、屏幕坐标；`client_to_screen` 返回 `None` 时明确记"坐标转换失败（鼠标不会移动）"。
+  2. `buy.rs::adjust_buy_qty`：把"点击加/减按钮"日志移到 `click_client_rect` 返回 `true` 之后，并区分"已派发 / 失败（坐标转换失败，未派发）"，消除误报。
+- **验证**：`CARGO_TARGET_DIR=target_verify` 编译链接通过；`cargo test` 4 passed / 0 failed（主 target 因运行中 .exe 持锁报 LNK1104，与代码无关）。
+- **待实机确认**：跑一次购买流程，据 `[CLICK-DIAG]` 判断根因分支——若打印"坐标转换失败 None"→ DPI/客户区基准错配（修 `client_to_screen` 或程序 DPI 感知）；若打印屏幕坐标但落点偏→ `det.plus` 检测器落点错（re-calibrate 加按钮）。
+
+## 2026-10-05（续十六）— DPI 声明已存在；加 hwnd/原点诊断定位 -30350 真因
+- **重要发现**：`main.rs` 早已有 `SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2)` 调用（751行），但用 `let _ =` **静默吞掉返回值**——它若被 manifest/框架拒绝会静默失败，进程退回 DPI-unaware，正是 ClientToScreen 坐标错乱的隐患。无 manifest/build.rs/.rc 干扰，声明本应生效。
+- **新证据指向 hwnd 而非 DPI**：同一窗口相邻点，加按钮(1770,860)→(1770,860) 恒等、购买按钮(1650,860)→(-30350,-31140) 爆负，非典型 DPI 虚拟化产物（虚拟化不会一恒等一爆负），更像是 `hwnd` 在移动调用时非有效游戏窗口句柄。
+- **改动（诊断，未改主逻辑）**：
+  1. `win.rs` 的 `click_client_rect`/`move_mouse_to_client` 诊断新增打印 `hwnd` 原始值 + `ClientToScreen(hwnd,(0,0))` 客户原点；
+  2. `main.rs` DPI 声明改为可见化记录成功/失败（定位是否真生效）。
+- **验证**：`target_verify` 编译链接通过（仅 lock 删除权限警告，无害）。
+- **待实机确认**：重跑购买流程，看 `[DPI]` 是否"已声明"；对比 `[CLICK-DIAG]` 与 `[MOVE-DIAG]` 的 `hwnd`/原点值——若二者 hwnd 不同或原点=`-30350` 类垃圾，则根因是句柄失效（疑似反作弊拦截外部进程坐标查询），需改用不依赖 ClientToScreen 的坐标换算。
+
+## 2026-10-06 — 价格可视化新增「一天/一周/一个月」时间范围切换（起点由数据动态推导）
+- **背景**：原可视化时间窗口被写死为「昨日 18:00 → 当前」（`window_start_ms` 基于本地午夜减 6h 推导），`VizState.range` 的「近7天/近30天」仅是占位提示、未接入过滤逻辑，实质只显示约一天数据；刻度为固定 3 小时、标签硬编码「昨日18:00/今日00:00」。
+- **改动（数据驱动 + 三档视图）**：
+  1. 新增依赖 `chrono = "0.4"`（本地时区格式化与刻度对齐）。
+  2. 删除写死的 `WINDOW_START_OFFSET_MS` / `local_day_start_ms` / `window_start_ms` 与 `GetLocalTime` 导入；新增 `range_duration_ms`（0=1天/1=7天/2=30天）、`range_label`、`choose_tick_step`（按跨度自适应步长，约 6~10 个标签）、`first_tick_ms`（按本地时区对齐到步长边界）、`fmt_local`（本地时间文本）。
+  3. `show` 重构窗口计算：先按口径/子弹/有效价筛选候选，取候选最大时间戳 `data_max` 为窗口右端，`window_start = data_max - range_duration_ms(range)`，起点完全由数据动态推导，绝不写死固定值；切换 `range` 下一帧即联动重算渲染。
+  4. `right_column` 标题行加动态副标题（`{} 至 {} · 视图：{}`），右侧新增分段控件 `range_selector`（一天/一周/一个月，当前项橙色高亮、其余浅底，点击即切换）。
+  5. `draw_chart` 时间轴改为自适应步长（1天→3h、1周→1天、1月→1周）+ 本地对齐刻度和含日期的动态标签；x 轴标题/空数据文案同步更新。
+- **验证**：`CARGO_TARGET_DIR=target_verify cargo check` 通过（exit 0，拉取 chrono 0.4.45）；`cargo test` 7 passed / 0 failed（含 `e2e_real_model_detects_scene`）。
+
+## 2026-10-10 — 购买结果 toast 类别识别（正常购买成功 / 低价购买成功）
+- **背景**：点击「购买」后游戏在窗口顶部居中弹出成功 toast（实测延迟 ≈0.3s、持续 ≈1.1s），此前流程完全盲等 400ms 即 ESC，购买结果无回读。需求：只识别两类购买成功（正常「已存入仓库」/ 低价「已用更低价格成交」），失败类（白字）与限流不在处理范围。
+- **关键标定发现（录屏逐帧实测）**：toast 文本中只有开头「子弹名 x 数量」是亮绿字，其后消息文本是白字；文本整体在窗口内水平居中（绿字左缘 L 与整句右缘 R 满足 R ≈ 2×窗口中心 − L，标定帧误差 ≤2px）；失败 toast 整句白字、无绿字。
+- **新模块 `src/domain/toast.rs`**（识别策略：纯图像判定，不引入中文 OCR，文字"读不准"但归类必须可靠）：
+  1. **绿字门控**：监听带（按客户区比例 y∈[13%,24%]H、x∈[15%,85%]W）内亮绿像素计数越阈 → 有成功 toast；失败白字 toast 天然被排除。
+  2. **候选带推导**：绿字 bbox 给出文本左缘与行高，按居中对称 `R=2×中心−L`(+48px 余量) 裁出「绿名+白消息」完整文本带，再按亮度 bbox 收紧到字形、高度归一 32px。
+  3. **判别模板滑动匹配**：内嵌「更低价格」白字字形模板（`assets/toast/lower_price_marker.jpg`，include_bytes 编译期打入，无外部文件依赖），与候选带逐 x 滑动 NCC，峰值 ≥0.6 判「低价购买成功」，否则「正常购买成功」。
+  4. **监听窗取峰值**：点击后监听 3s（90ms 轮询、F9 可中断），累计 NCC 峰值再判定，容忍淡入淡出模糊帧；「低价」确定性命中即提前返回。
+- **流程接线**：`observe.rs` Proceed 分支把原 400ms 盲等替换为 `toast::monitor_after_buy`；结果经新消息 `ObserveMsg::BuyResultNotice` 渲染到毛玻璃面板（`buy_result` 字段，floating_panel 展示、BuyCleared/Done/enter_active 统一清理）；未捕获到绿字 toast 记 `[BUY][WARN]`（可能静默失败），不阻断主流程、照常 ESC。
+- **标定数据分离度**：低价自匹配 NCC=0.992，正常文案交叉匹配=0.275，阈值 0.6 双边余量 >0.3。
+- **验证**：新增 4 个单测（模板加载 / 失败白字不触绿门 / 成功帧过绿门 / 低价高分且正常低分）全过；`cargo test` 11 passed / 0 failed（原 7 + 新 4），无回归。
+
+## 2026-10-13 — 购买后判断逐模式核查 + 导游低价提醒
+- **模式界定**：本工程的「购买模式」即 `BuyScene` 两变体——`Exchangeable`（可兑换子弹场景，BUY_LAYOUT_1）/ `NonExchangeable`（不可兑换子弹场景，BUY_LAYOUT_2）。购买点击在 `observe.rs:431` **仅一处**，之后紧跟 `toast::monitor_after_buy`，两场景均经这条**同一条已接入 toast 判定的购买路径**（buy 坐标取自 `s.layout().buy`），故两模式都已接入「正常/低价购买」判定。数量采集工具 `qty_tool` 的点击为 +/- 采集训练数据，非购买，不计入。
+- **`BuyScene` 增强**：新增 `#[derive(Hash)]` 与 `BuyScene::all()`（遍历用）；新增单测 `buy_scene_all_covers_every_variant` 锁住「两变体均被核查遍历且各含购买按钮坐标」不变量。
+- **逐模式核查表**：`ObserverApp.buy_result_by_scene: HashMap<BuyScene,String>`，`ObserveMsg::BuyResultNotice` 新增 `scene` 字段；每次购买完成据所属场景记入该表（Done 时统一清空，BuyCleared 不清除以跨弹药累计）。
+- **毛玻璃面板**：新增「购买后判断 · 模式核查」区块，逐模式列出 `✓ 已接入` 与该模式上次实测结果（尚无记录则「尚无购买记录」），实机逐模式验证可视化。
+- **导游低价提醒**：`observe.rs` 点击购买后，据 `monitor_after_buy` 的 `BuyToastKind` 调用 `tour.ask` 提醒——低价成交显「本次为低价购买成功（已用更低价格成交）」、正常显「正常购买成功」、未捕获显「未捕获到成功提示」，回车后再 ESC 返回扫描；非导游态为无操作。
+- **验证**：`cargo check` 0 错；`cargo test` 12 passed / 0 failed（原 11 + 新 1），无回归。
+
+## 2026-10-13 — 购买区域优化：口径拖拽排序 + 子弹网格布局
+- **需求**：勾选「是否购买」后展示的各口径子弹区域需支持 (1) 拖拽调整口径先后顺序以控制处理顺序；(2) 子弹改横向/网格排列提升多子弹可见性。
+- **数据模型**：`ObserverApp` 新增 `buy_caliber_order: Vec<String>`（口径级处理顺序，经 `buy_order.txt` 持久化，每行一个口径）、拖拽临时态 `drag_src`/`drop_dst: Option<usize>`。原 `buy.cfg` 不变。
+- **控制面板 `control_panel.rs` 重构**：
+  - 口径改为可拖拽卡片：卡左上角竖排三点 grip 手柄（`Sense::drag()` 发起拖拽，不阻塞下方阈值输入），卡内口径名带序号；拖拽源卡半透明、落点卡蓝色高亮描边。
+  - 卡片内子弹由纯纵向长列改为 `horizontal_wrapped` 网格（每项 150px 宽，自动换行），提升单屏可见性。
+  - 落点判定用卡片 `Frame` 矩形 `contains(指针)`，释放主指针时移动元素并 `persist_buy_order`；指针离窗等异常安全复位。
+  - 新增「重置顺序」按钮清空顺序（运行期回退到口径名排序）；每帧与校准配置对账（剔除已移除口径、补入新增口径按名排序），保证「展示=处理顺序」且完整。
+- **观察流程 `observe.rs`**：`run_observation` 新增 `buy_caliber_order` 参数，原 `calibers.sort()` 替换为纯函数 `resolve_caliber_order(preferred, info)`——保留用户顺序、剔除配置已删口径、补入未列口径按名排序；空顺序等价于旧版口径名排序，向后兼容。`main.rs::start_observation` 透传。
+- **验证**：新增 2 个单测锁定 `resolve_caliber_order` 不变量（保留优先序+补尾排序、剔除失效项、空序=全量名排序）；`cargo check` 0 错；`cargo test` 14 passed / 0 failed（原 12 + 新 2），无回归。

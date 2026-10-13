@@ -3,3 +3,5 @@ torchvision>=0.15
 pillow
 numpy
 onnx>=1.13
+# onnxruntime 可选：仅 predict_layout.py 走 ONNX 推理时需要；缺失时自动回退到 PyTorch。
+# onnxruntime>=1.13

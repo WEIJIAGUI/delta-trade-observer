@@ -5,7 +5,12 @@
 pub mod config;
 pub mod ocr;
 pub mod observe;
+pub mod buy;
 pub mod digit;
 pub mod nn_classifier;
 pub mod recognition;
 pub mod records;
+pub mod buttons;
+pub mod qty_classifier;
+pub mod qty_tool;
+pub mod toast;

@@ -13,7 +13,7 @@ import sys
 import torch
 from PIL import Image
 
-from train import CLASSES, DigitCNN, INPUT_SIZE, TRANSFORM
+from train import CLASSES, DigitCNN, DIGIT_TRANSFORM
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(HERE, "model.pt")
@@ -39,7 +39,7 @@ def main() -> None:
     model.eval()
 
     img = Image.open(img_path).convert("RGB")
-    x = TRANSFORM(img).unsqueeze(0)
+    x = DIGIT_TRANSFORM(img).unsqueeze(0)
     with torch.no_grad():
         logits = model(x)[0]
     probs = torch.softmax(logits, dim=0)

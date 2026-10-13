@@ -7,3 +7,4 @@ pub mod control_panel;
 pub mod floating_panel;
 pub mod ocr_test_panel;
 pub mod price_viz_panel;
+pub mod qty_tool_panel;

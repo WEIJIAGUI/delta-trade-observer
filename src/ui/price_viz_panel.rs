@@ -1,33 +1,95 @@
-//! 价格可视化 Tab：口径筛选 → 选择子弹 → 最近 24 小时价格折线图。
+//! 价格可视化 Tab：口径筛选 → 选择子弹 → 价格折线图。
 //!
 //! 数据源：观察流程落盘的 `save_path/records.jsonl`（见 [`crate::observe::records_file`]）。
 //! 布局（白色主题）：左右分栏——左侧为自适应侧栏（口径下拉 + 子弹单选列表，宽度
 //! 随窗口按比例取值且可拖拽分隔条调整），右侧占剩余全部空间，纵向排布标题、
 //! 信息带、折线图与底部统计条。图表为 egui Painter 自绘，
-//! 不引入额外绘图依赖。当前阶段仅展示最近 24 小时数据。记录缓存按文件 mtime 失效重读。
+//! 不引入额外绘图依赖。时间范围支持「一天 / 一周 / 一个月」三档视图，
+//! 窗口起点由数据记录中的最新时间戳动态推导（绝不写死固定值）。记录缓存按文件 mtime 失效重读。
 
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use chrono::{Datelike, Local, TimeZone};
 use eframe::egui::{self, Align2, Color32, FontId, Margin, RichText, Sense, Stroke, Ui};
-use windows::Win32::System::SystemInformation::GetLocalTime;
 
 use crate::domain::records::{self, PriceRecord};
 use crate::observe::records_file;
 
-/// 可视化时间窗口：从今日 00:00（本地午夜）起，到当日 24:00（次日午夜）的完整一天。
-const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+/// 一天 / 一周 / 一个月对应的窗口时长（毫秒）。
+const MS_PER_DAY: u64 = 24 * 60 * 60 * 1000;
 
-/// 取「今日 00:00（本地午夜）」的 UTC 毫秒时间戳：用本地时钟算出距午夜的偏移，
-/// 再从当前 UTC 毫秒回退该偏移。这样时间轴起点严格对齐到本地 0 点。
-fn local_day_start_ms(now_ms: u64) -> u64 {
-    unsafe {
-        let lt = GetLocalTime();
-        let since_midnight_ms = ((lt.wHour as u64 * 60 + lt.wMinute as u64) * 60
-            + lt.wSecond as u64)
-            * 1000
-            + lt.wMilliseconds as u64;
-        now_ms.saturating_sub(since_midnight_ms)
+/// 时间范围模式 → 窗口时长（毫秒）。0=一天，1=一周，2=一个月。
+/// 窗口起点 = 数据最新时间戳 − 该时长，完全由数据动态推导，不写死固定值。
+fn range_duration_ms(range: u8) -> u64 {
+    match range {
+        1 => 7 * MS_PER_DAY,
+        2 => 30 * MS_PER_DAY,
+        _ => MS_PER_DAY,
+    }
+}
+
+/// 时间范围模式 → 中文标签。
+fn range_label(range: u8) -> &'static str {
+    match range {
+        1 => "一周",
+        2 => "一个月",
+        _ => "一天",
+    }
+}
+
+/// 依据窗口跨度挑选「整洁」的刻度步长，使标签数落在约 6~10 个。
+fn choose_tick_step(span_ms: u64) -> u64 {
+    const CANDIDATES: [u64; 7] = [
+        3 * 3_600_000,  // 3 小时
+        6 * 3_600_000,  // 6 小时
+        12 * 3_600_000, // 12 小时
+        1 * MS_PER_DAY, // 1 天
+        2 * MS_PER_DAY, // 2 天
+        7 * MS_PER_DAY, // 1 周
+        14 * MS_PER_DAY, // 2 周
+    ];
+    for &c in CANDIDATES.iter() {
+        if span_ms / c <= 10 {
+            return c;
+        }
+    }
+    *CANDIDATES.last().unwrap()
+}
+
+/// 取 ≥ window_start 的第一个刻度时间戳，并按本地时区对齐到步长边界
+/// （整天步长对齐本地 0 点，小时级步长对齐本地 0 点后的整倍数），避免刻度落在任意时刻。
+fn first_tick_ms(window_start: u64, step_ms: u64) -> u64 {
+    let Some(dt) = Local.timestamp_millis_opt(window_start as i64).single() else {
+        return ((window_start + step_ms - 1) / step_ms) * step_ms;
+    };
+    let day0 = Local
+        .with_ymd_and_hms(dt.year(), dt.month(), dt.day(), 0, 0, 0)
+        .single()
+        .map(|d| d.timestamp_millis() as u64)
+        .unwrap_or(window_start);
+    if step_ms >= MS_PER_DAY {
+        let mut t = day0;
+        while t < window_start {
+            t += step_ms;
+        }
+        t
+    } else {
+        let offset = window_start.saturating_sub(day0);
+        day0 + (offset / step_ms + 1) * step_ms
+    }
+}
+
+/// 把毫秒时间戳格式化为本地时间文本（用于坐标轴刻度与副标题）。
+fn fmt_local(ts_ms: u64, with_date: bool) -> String {
+    if let Some(dt) = Local.timestamp_millis_opt(ts_ms as i64).single() {
+        if with_date {
+            dt.format("%m/%d %H:%M").to_string()
+        } else {
+            dt.format("%H:%M").to_string()
+        }
+    } else {
+        String::new()
     }
 }
 
@@ -66,8 +128,7 @@ pub struct VizState {
     pub records: Vec<PriceRecord>,
     /// 上次加载时的记录文件 mtime（缓存失效判断）。
     pub mtime: Option<SystemTime>,
-    /// 时间范围选择：0=近7天（设计稿默认），1=近30天，2=自定义。
-    /// 当前阶段仅支持最近 24 小时展示，非 0 时界面给出提示。
+    /// 时间范围模式：0=一天，1=一周，2=一个月。窗口起点由数据动态确定（见 `show`）。
     pub range: u8,
     /// 是否弹出「清除数据」确认对话框（点击清除按钮后置位，确认/取消后清零）。
     pub clear_pending: bool,
@@ -108,24 +169,23 @@ impl PriceVizPanel {
             st.bullet = bullets[0].clone();
         }
 
-        // 今日价格点（时间升序）：窗口从今日 00:00（本地午夜）起，到当前时刻。
+        // 价格点（时间升序）：先按口径/子弹/有效价筛选候选（不限时间），
+        // 取候选中最大时间戳（最新一条记录）作为窗口右端点，向左回退对应时长得到起点。
+        // 起点完全由数据时间动态推导，不写死固定值；切换 range 时窗口随之联动。
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        let day_start = local_day_start_ms(now_ms);
         let mut pts: Vec<(u64, u32)> = st
             .records
             .iter()
-            .filter(|r| {
-                r.caliber == st.caliber
-                    && r.bullet == st.bullet
-                    && r.price.is_some()
-                    && r.ts_ms >= day_start
-                    && r.ts_ms <= now_ms
-            })
+            .filter(|r| r.caliber == st.caliber && r.bullet == st.bullet && r.price.is_some())
             .map(|r| (r.ts_ms, r.price.unwrap()))
             .collect();
+        let data_max = pts.iter().map(|p| p.0).max().unwrap_or(now_ms);
+        let window_start = data_max.saturating_sub(range_duration_ms(st.range));
+        let window_end = data_max;
+        pts.retain(|p| p.0 >= window_start && p.0 <= window_end);
         pts.sort_by_key(|p| p.0);
 
         // 左右分栏：用 egui 原生 SidePanel + CentralPanel 实现各栏独立纵向布局，
@@ -151,7 +211,7 @@ impl PriceVizPanel {
                     .inner_margin(egui::Margin::same(14.0)),
             )
             .show_inside(ui, |ui| {
-                Self::right_column(ui, st, &pts, day_start);
+                Self::right_column(ui, st, &pts, window_start, window_end);
             });
 
         // 清除数据确认对话框：仅在 clear_pending 置位时弹出，确认后才真正删除文件。
@@ -330,12 +390,18 @@ impl PriceVizPanel {
 
     // ---- 右栏：标题 + 信息带 + 折线图 + 底部统计条 ----
 
-    fn right_column(ui: &mut Ui, st: &mut VizState, pts: &[(u64, u32)], day_start: u64) {
+    fn right_column(
+        ui: &mut Ui,
+        st: &mut VizState,
+        pts: &[(u64, u32)],
+        window_start: u64,
+        window_end: u64,
+    ) {
         // CentralPanel 已提供白色底与内边距，这里直接纵向排布内容。
         ui.set_min_width(ui.available_width());
 
-        // 标题行：左侧标题/副标题，右侧时间范围按钮。
-        ui.with_layout(egui::Layout::left_to_right(egui::Align::TOP), |ui| {
+        // 标题行：左侧标题 + 动态窗口副标题；右侧时间范围分段控件。
+        ui.horizontal(|ui| {
             ui.vertical(|ui| {
                 ui.label(
                     RichText::new(format!("{} · 价格波动", st.bullet))
@@ -343,22 +409,18 @@ impl PriceVizPanel {
                         .color(TEXT)
                         .strong(),
                 );
-                ui.label(
-                    RichText::new("价格（哈夫币） · 今日 00:00 起")
-                        .size(12.0)
-                        .color(MUTED),
+                let sub = format!(
+                    "价格（哈夫币） · {} 至 {} · 视图：{}",
+                    fmt_local(window_start, true),
+                    fmt_local(window_end, true),
+                    range_label(st.range),
                 );
+                ui.label(RichText::new(sub).size(12.0).color(MUTED));
             });
-            
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+                Self::range_selector(ui, st);
+            });
         });
-        if st.range != 0 {
-            ui.add_space(4.0);
-            ui.label(
-                RichText::new("当前阶段仅支持今日 00:00 起的数据")
-                    .size(11.0)
-                    .color(ACCENT),
-            );
-        }
 
         ui.add_space(8.0);
         ui.add_space(8.0);
@@ -366,26 +428,47 @@ impl PriceVizPanel {
         let avail_w = ui.available_width();
         let chart_h = (ui.available_height() - 64.0).max(180.0);
         let (crect, _) = ui.allocate_exact_size(egui::vec2(avail_w, chart_h), Sense::hover());
-        draw_chart(ui, crect, pts, day_start);
+        draw_chart(ui, crect, pts, window_start, window_end);
 
         ui.add_space(8.0);
         summary_bar(ui, pts);
+    }
+
+    /// 时间范围分段控件：一天 / 一周 / 一个月，互斥高亮当前选项。
+    /// 点击即切换 `st.range`，下一帧 `show` 以新窗口重算并渲染，数据随之联动。
+    fn range_selector(ui: &mut Ui, st: &mut VizState) {
+        let opts: [(u8, &str); 3] = [(0, "一天"), (1, "一周"), (2, "一个月")];
+        for (val, label) in opts {
+            let active = st.range == val;
+            let resp = ui.add(
+                egui::Button::new(
+                    RichText::new(label).color(if active { Color32::WHITE } else { TEXT }),
+                )
+                .fill(if active { ACCENT } else { PANEL2 })
+                .stroke(Stroke::new(1.0, ACCENT))
+                .rounding(6.0)
+                .min_size(egui::vec2(60.0, 28.0)),
+            );
+            if resp.clicked() {
+                st.range = val;
+            }
+        }
     }
 }
 
 // ---- 自绘图表 ----
 
 /// 折线图：白底 + 橙色主线 + 渐变填充 + 峰值标注。
-/// x 轴固定为「今日 00:00（本地午夜）→ 当日 24:00」的完整一天，起点严格对齐到 0 点；
-/// 刻度标签取本地整点（00:00 / 02:00 / … / 24:00），无需时区库。
-fn draw_chart(ui: &mut Ui, rect: egui::Rect, pts: &[(u64, u32)], day_start: u64) {
+/// x 轴为「数据最新时刻 − 所选窗口时长 → 数据最新时刻」的动态窗口；
+/// 刻度步长随窗口跨度自适应（一天→3 小时，一周→1 天，一个月→1 周），并按本地时区对齐。
+fn draw_chart(ui: &mut Ui, rect: egui::Rect, pts: &[(u64, u32)], window_start: u64, window_end: u64) {
     let p = ui.painter_at(rect);
     p.rect_filled(rect, 8.0, CHART_BG);
     if pts.is_empty() {
         p.text(
             rect.center(),
             Align2::CENTER_CENTER,
-            "暂无今日 00:00 起的价格数据",
+            "暂无该时间段内的价格数据",
             FontId::proportional(13.0),
             MUTED,
         );
@@ -408,9 +491,9 @@ fn draw_chart(ui: &mut Ui, rect: egui::Rect, pts: &[(u64, u32)], day_start: u64)
         );
         return;
     }
-    // x 轴域：今日 00:00 → 当日 24:00（完整一天），起点严格对齐本地午夜。
-    let x0 = day_start as f64;
-    let x1 = (day_start + DAY_MS) as f64;
+    // x 轴域：窗口起点（window_start）→ 窗口终点（window_end，数据最新时刻）。
+    let x0 = window_start as f64;
+    let x1 = (window_end.max(window_start + 1)) as f64;
     let xs = |ts: u64| -> f32 {
         let t = ((ts as f64 - x0) / (x1 - x0).max(1.0)).clamp(0.0, 1.0);
         plot.left() + t as f32 * plot.width()
@@ -486,25 +569,29 @@ fn draw_chart(ui: &mut Ui, rect: egui::Rect, pts: &[(u64, u32)], day_start: u64)
     }
 
     // 先画竖直网格（时间）与水平网格（价格）+ 刻度标签。
-    // 时间刻度对齐到本地整点：00:00 / 02:00 / … / 24:00，起点严格为今日 0 点。
-    for k in 0..=12 {
-        let x = xs(day_start + (k as u64) * 2 * 3600 * 1000);
+    // 时间刻度：步长随窗口跨度自适应，并对齐到本地时区边界（整天→本地 0 点，
+    // 小时级→本地 0 点后的整倍数），标签含日期当且仅当窗口跨越多天。
+    let span_ms = window_end.saturating_sub(window_start);
+    let step_ms = choose_tick_step(span_ms);
+    let first_tick = first_tick_ms(window_start, step_ms);
+    let with_date = span_ms > 2 * MS_PER_DAY;
+    let mut k = first_tick;
+    let mut safety: u32 = 0;
+    while k <= window_end && safety < 256 {
+        let x = xs(k);
         p.line_segment(
             [egui::pos2(x, plot.top()), egui::pos2(x, plot.bottom())],
             Stroke::new(1.0, grid_color()),
         );
-        let label = if k == 12 {
-            "24:00".to_string()
-        } else {
-            format!("{:02}:00", k * 2)
-        };
         p.text(
             egui::pos2(x, plot.bottom() + 12.0),
             Align2::CENTER_CENTER,
-            label,
+            fmt_local(k, with_date),
             FontId::proportional(11.0),
             MUTED,
         );
+        k += step_ms;
+        safety += 1;
     }
     for &v in &tick_vals {
         let y = ymap(v);
@@ -623,7 +710,7 @@ fn draw_chart(ui: &mut Ui, rect: egui::Rect, pts: &[(u64, u32)], day_start: u64)
     p.text(
         egui::pos2(plot.center().x, rect.bottom() - 8.0),
         Align2::CENTER_CENTER,
-        "时间（今日 00:00 起）",
+        "时间（数据最新时刻回退所选窗口）",
         FontId::proportional(11.0),
         MUTED,
     );

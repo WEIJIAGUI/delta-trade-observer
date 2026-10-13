@@ -6,6 +6,7 @@
 //! `src/screenshot.rs`，本文件不再包含截图实现。
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::thread;
 
 use windows::core::PCWSTR;
@@ -17,7 +18,7 @@ use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
     KEYEVENTF_UNICODE, MOUSEINPUT, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, SendInput, VK_A,
-    VK_BACK, VK_CONTROL, VK_RETURN, VIRTUAL_KEY,
+    VK_BACK, VK_CONTROL, VK_ESCAPE, VK_RETURN, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetCursorPos, GetForegroundWindow, GetWindowTextLengthW, GetWindowTextW,
@@ -25,6 +26,27 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetWindowDisplayAffinity, SetWindowPos, SetCursorPos, ShowWindow, HWND_TOP, SWP_NOMOVE,
     SWP_NOSIZE, SWP_SHOWWINDOW, SW_RESTORE, WINDOW_DISPLAY_AFFINITY,
 };
+
+use crate::config::Scale;
+
+/// 诊断日志总开关：默认关闭（返回 `false`）。
+///
+/// 仅当环境变量 `DELTA_OBSERVER_DEBUG` 为 `1` / `true` / `yes` / `on` 时启用，
+/// 启用后 [`click_client_rect`] / [`move_mouse_to_client`] 才会输出 `[CLICK-DIAG]` /
+/// `[MOVE-DIAG]` 坐标细节，以及额外的 `ClientToScreen(hwnd,(0,0))` 探测。
+/// 常态运行下不输出，避免把观察日志（observe.log）刷满坐标细节、也不额外调用一次坐标转换。
+fn diag_enabled() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        match std::env::var("DELTA_OBSERVER_DEBUG") {
+            Ok(v) => {
+                let v = v.trim().to_ascii_lowercase();
+                v == "1" || v == "true" || v == "yes" || v == "on"
+            }
+            Err(_) => false,
+        }
+    })
+}
 
 /// 枚举窗口时的上下文：要匹配的关键字 + 命中结果。
 struct SearchCtx {
@@ -466,4 +488,104 @@ pub fn type_into_search(hwnd: HWND, text: &str, rect: [i32; 4]) {
     // 回车触发检索
     send_vk(VK_RETURN, true);
     send_vk(VK_RETURN, false);
+}
+
+/// 打开购买界面：在 `buy_area` 的**中央 50×50 区域**内随机取一点点击，使游戏弹出其购买 / 确认界面。
+///
+/// **仅执行一次点击，不等待、不 ESC、不恢复焦点**——点击后停留在该界面，
+/// 由购买阶段（`buy` 模块）轮询等待界面稳定并做重验证，结束后再统一 ESC 返回扫描。
+///
+/// 坐标契约：`buy_area` 为标定视口（`CALIB_VIEWPORT_W`）下的矩形，由调用方传入**未缩放**原值，
+/// 本函数内部按 `scale` 映射到实际客户区，点击落点**严格限制在** `buy_area` 的中央 50×50 子区域内
+/// （相对 `buy_area` 左上角：横向 `239..289`、纵向 `25..75`），杜绝越界点击到外部区域。
+///
+/// 返回是否成功执行（坐标转换失败返回 `false`）。
+pub fn open_buy_interface(hwnd: HWND, buy_area: [i32; 4], scale: &Scale) -> bool {
+    // 中央 50×50 子区域：相对 buy_area 左上角，标定视口坐标（与 buy_area 同一坐标契约）。
+    // 横向 239..289（宽 50）、纵向 25..75（高 50），由总区域尺寸 478×100 推得。
+    let central = [buy_area[0] + 239, buy_area[1] + 25, 50, 50];
+    let area = scale.rect(central);
+    // 在 central 区域内随机取一点（含边界，绝不越出该 50×50 范围）。
+    let tx = area[0] + rnd_range(0, area[2].max(1) as i64) as i32;
+    let ty = area[1] + rnd_range(0, area[3].max(1) as i64) as i32;
+    let (sx, sy) = match client_to_screen(hwnd, tx, ty) {
+        Some(p) => p,
+        None => return false,
+    };
+    mouse_click_screen(sx, sy);
+    true
+}
+
+/// 发送一次 ESC 键（按下 → 抬起），用于购买阶段结束 / 取消后返回扫描阶段。
+///
+/// 购买阶段无论「价格回升中止」还是「触发购买提示后」，均以 ESC 退出当前界面回到扫描，
+/// 由调用方在调用前后负责窗口焦点恢复。
+pub fn send_esc() {
+    send_vk(VK_ESCAPE, true);
+    rnd_sleep_ms(20, 50);
+    send_vk(VK_ESCAPE, false);
+}
+
+/// 在客户区坐标矩形中心处模拟一次人类左键点击（先人类化移动，再按下/抬起）。
+///
+/// 坐标契约：`rect` 为相对客户区左上角的 `[x, y, w, h]`，与本程序其余坐标约定一致；
+/// 内部经 `client_to_screen` 转换为屏幕坐标后派发 `SendInput`。
+/// 购买阶段「减 / 加 / 购买」按钮即经此点击。
+/// 返回是否成功（坐标转换失败返回 `false`）。
+pub fn click_client_rect(hwnd: HWND, rect: [i32; 4]) -> bool {
+    let cx = rect[0] + rect[2] / 2;
+    let cy = rect[1] + rect[3] / 2;
+    let (sx, sy) = match client_to_screen(hwnd, cx, cy) {
+        Some(p) => p,
+        None => {
+            if diag_enabled() {
+                crate::log::write(&format!(
+                    "[CLICK-DIAG] 坐标转换失败 client_to_screen 返回 None（鼠标不会移动）：hwnd={:?} rect={:?} 客户区中心=({},{})",
+                    hwnd.0, rect, cx, cy
+                ));
+            }
+            return false;
+        }
+    };
+    if diag_enabled() {
+        // 仅在排查时额外做一次原点探测，常态运行不消耗该调用。
+        let origin = client_to_screen(hwnd, 0, 0);
+        crate::log::write(&format!(
+            "[CLICK-DIAG] 已派发点击：hwnd={:?} rect={:?} 客户区中心=({},{}) → 屏幕坐标=({},{}) 窗口客户原点={:?}",
+            hwnd.0, rect, cx, cy, sx, sy, origin
+        ));
+    }
+    mouse_click_screen(sx, sy);
+    true
+}
+
+/// 把鼠标移动（人类化轨迹，不点击）到客户区坐标矩形中心。
+///
+/// 购买阶段「数量已对齐目标」后，把光标移到「购买」按钮中心待命（暂不点击），
+/// 由调用方随后统一 ESC 退出。坐标契约同 [`click_client_rect`]。
+/// 返回是否成功（坐标转换失败返回 `false`）。
+pub fn move_mouse_to_client(hwnd: HWND, rect: [i32; 4]) -> bool {
+    let cx = rect[0] + rect[2] / 2;
+    let cy = rect[1] + rect[3] / 2;
+    let (sx, sy) = match client_to_screen(hwnd, cx, cy) {
+        Some(p) => p,
+        None => {
+            if diag_enabled() {
+                crate::log::write(&format!(
+                    "[MOVE-DIAG] 坐标转换失败 client_to_screen 返回 None（鼠标不会移动）：hwnd={:?} rect={:?} 客户区中心=({},{})",
+                    hwnd.0, rect, cx, cy
+                ));
+            }
+            return false;
+        }
+    };
+    if diag_enabled() {
+        let origin = client_to_screen(hwnd, 0, 0);
+        crate::log::write(&format!(
+            "[MOVE-DIAG] 已派发移动：hwnd={:?} rect={:?} 客户区中心=({},{}) → 屏幕坐标=({},{}) 窗口客户原点={:?}",
+            hwnd.0, rect, cx, cy, sx, sy, origin
+        ));
+    }
+    move_mouse_human(sx, sy);
+    true
 }
