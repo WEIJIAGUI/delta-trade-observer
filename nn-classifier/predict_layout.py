@@ -33,6 +33,8 @@ from train import (
     BUTTON_HM,
     LAYOUTS,
     determine_case,
+    LAYOUT_INPUT_SIZE,
+    layout_preprocess,
 )
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -143,6 +145,25 @@ def run_torch(model_path, tensor):
     return hm.numpy(), sz.numpy()
 
 
+def predict_layout_case(img: Image.Image, model_path: str):
+    """方案 A：布局二分类推理（模型输出 logits [2]），返回 0/1。"""
+    tensor = layout_preprocess(img)
+    if model_path.endswith(".onnx"):
+        import onnxruntime as ort
+
+        sess = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+        logits = sess.run(None, {"input": tensor})[0][0]
+    else:
+        from train import LayoutClassifier
+
+        model = LayoutClassifier()
+        model.load_state_dict(torch.load(model_path, map_location="cpu"))
+        model.eval()
+        with torch.no_grad():
+            logits = model(torch.from_numpy(tensor))[0].numpy()
+    return int(np.argmax(logits))
+
+
 def _draw(img: Image.Image, dets, out_path: str):
     d = ImageDraw.Draw(img)
     try:
@@ -170,11 +191,30 @@ def main() -> None:
     ap.add_argument("--model", default=os.path.join(HERE, "buttons.onnx"), help="模型文件（.onnx 或 .pt）")
     ap.add_argument("--thresh", type=float, default=THRESH, help="热力图峰值阈值（低于则判为无该按钮）")
     ap.add_argument("--draw", default="", help="可选：把检测框画到该路径输出 PNG")
+    ap.add_argument(
+        "--layout",
+        action="store_true",
+        help="方案A布局二分类模式（模型输出 logits，坐标纯查表）",
+    )
     args = ap.parse_args()
 
     if not os.path.isfile(args.image):
         raise SystemExit(f"未找到图片：{args.image}")
     img = Image.open(args.image)
+
+    if args.layout:
+        case = predict_layout_case(img, args.model)
+        result = {
+            "image": args.image,
+            "case": case,
+            "targets": {k: list(v) for k, v in LAYOUTS[case].items()},
+        }
+        print(json.dumps(result, ensure_ascii=False))
+        if args.draw:
+            dets = {k: {"bbox": list(v)} for k, v in LAYOUTS[case].items()}
+            _draw(img, dets, args.draw)
+        return
+
     orig_w, orig_h = img.size
     tensor, _ = preprocess(img)
 

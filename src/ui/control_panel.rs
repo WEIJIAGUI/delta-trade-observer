@@ -32,6 +32,36 @@ impl ControlPanel {
     fn observe_panel(ui: &mut Ui, app: &mut ObserverApp) {
         let obs_accent = Color32::from_rgb(56, 135, 255);
         card(ui, obs_accent, |ui| {
+            // —— 顺序调整：面板最外层入口（切换到全屏顺序调整页：左口径 / 右子弹）——
+            ui.horizontal(|ui| {
+                let b = egui::Button::new(
+                    RichText::new("⚙  顺序调整（口径 / 子弹）")
+                        .strong()
+                        .color(Color32::from_rgb(56, 135, 255)),
+                )
+                .min_size(egui::vec2(240.0, 34.0))
+                .fill(Color32::from_rgba_unmultiplied(235, 242, 255, 255))
+                .rounding(8.0)
+                .stroke(egui::Stroke::new(1.0, Color32::from_rgb(56, 135, 255)));
+                if ui.add(b).clicked() {
+                    // 页面切换（取代模态弹窗）：重置拖拽态避免泄漏，默认选中第一个口径。
+                    app.drag_src = None;
+                    app.drop_dst = None;
+                    app.drag_scope = None;
+                    app.drag_pointer = None;
+                    app.drag_snap_target = None;
+                    app.drag_snap_t0 = None;
+                    app.order_selected_caliber = app.buy_caliber_order.first().cloned();
+                    app.page = crate::Page::OrderAdjust;
+                }
+                ui.label(
+                    RichText::new("拖拽调整口径与子弹的处理先后（上/左=先处理）。")
+                        .small()
+                        .color(Color32::from_rgba_unmultiplied(90, 100, 120, 200)),
+                );
+            });
+            ui.add_space(10.0);
+
             ui.heading(RichText::new("开始观察").color(obs_accent));
             ui.add_space(4.0);
             ui.label("聚焦游戏窗口并进入常驻毛玻璃悬浮状态，循环检索各口径并识别价格。");
@@ -166,22 +196,14 @@ impl ControlPanel {
                         .color(Color32::from_rgba_unmultiplied(90, 100, 120, 200)),
                 );
                 ui.add_space(4.0);
-                // —— 口径处理顺序：可拖拽卡片（拖拽手柄调整先后，控制观察流程中子弹处理顺序）——
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("处理顺序：拖拽口径卡片调整先后（上=先处理）；卡片内子弹已网格排列。")
-                            .small()
-                            .color(Color32::from_rgba_unmultiplied(90, 100, 120, 200)),
-                    );
-                    if ui.button("重置顺序").clicked() {
-                        // 清空后运行期回退到「口径名排序」默认顺序。
-                        app.buy_caliber_order.clear();
-                        crate::persist_buy_order(&[]);
-                    }
-                });
+                // —— 各口径子弹「最低接受价格」输入框（每颗子弹各自输入，默认 10000；改动后持久化为新的默认）——
+                ui.label(
+                    RichText::new("各子弹「最低接受价格」（哈夫币）：留空或保持 10000 表示不设阈值；价格低于该值且开启购买时自动操作。")
+                        .small()
+                        .color(Color32::from_rgba_unmultiplied(90, 100, 120, 200)),
+                );
                 ui.add_space(4.0);
-
-                // 与校准配置对账：剔除已移除口径、补入新增口径（按名排序），保证「展示=处理顺序」且完整。
+                // 与校准配置对账：剔除已移除口径、补入新增口径（按名排序），保证展示完整。
                 {
                     let info_keys: Vec<String> = app.info.keys().cloned().collect();
                     app.buy_caliber_order.retain(|c| info_keys.contains(c));
@@ -192,123 +214,58 @@ impl ControlPanel {
                     missing.sort();
                     app.buy_caliber_order.extend(missing);
                 }
-
-                // 拖拽落定（每帧统一在循环外判定一次）：释放主指针时移动并持久化；异常（指针离窗）复位。
-                let released = ui
-                    .ctx()
-                    .input(|i| i.pointer.button_released(egui::PointerButton::Primary));
-                let down = ui.ctx().input(|i| i.pointer.primary_down());
-                if released {
-                    if let (Some(src), Some(dst)) = (app.drag_src, app.drop_dst) {
-                        if src != dst && dst < app.buy_caliber_order.len() {
-                            let item = app.buy_caliber_order.remove(src);
-                            app.buy_caliber_order.insert(dst, item);
-                            crate::persist_buy_order(&app.buy_caliber_order);
-                        }
-                    }
-                    app.drag_src = None;
-                    app.drop_dst = None;
-                } else if !down && app.drag_src.is_some() {
-                    app.drag_src = None;
-                    app.drop_dst = None;
-                }
-
-                let n_cal = app.buy_caliber_order.len();
-                for i in 0..n_cal {
-                    let cal = app.buy_caliber_order[i].clone();
-                    // 卡片状态：源卡半透明、落点卡蓝色高亮描边。
-                    let is_src = app.drag_src == Some(i);
-                    let is_dst = app.drop_dst == Some(i) && app.drag_src.is_some() && !is_src;
-                    let stroke = if is_dst {
-                        egui::Stroke::new(2.0, Color32::from_rgb(56, 135, 255))
-                    } else {
-                        egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(200, 206, 214, 255))
-                    };
-                    let frame = egui::Frame::default()
-                        .fill(Color32::from_rgba_unmultiplied(
-                            255,
-                            255,
-                            255,
-                            if is_src { 130 } else { 255 },
-                        ))
-                        .rounding(8.0)
-                        .stroke(stroke)
-                        .inner_margin(egui::Margin::same(10.0));
-                    let card_resp = frame
-                        .show(ui, |ui| {
-                            // 拖拽手柄 + 口径标题：手柄承载 Sense::drag 以发起拖拽，不阻塞下方阈值输入。
-                            ui.horizontal(|ui| {
-                                let handle =
-                                    ui.allocate_response(egui::vec2(18.0, 18.0), egui::Sense::drag());
-                                if handle.drag_started() {
-                                    app.drag_src = Some(i);
-                                }
-                                // 手柄视觉：三点竖排 grip。
-                                let r = handle.rect;
-                                let painter = ui.painter();
-                                for k in 0..3 {
-                                    let cy = r.min.y + 4.0 + k as f32 * 5.0;
-                                    painter.circle_filled(
-                                        egui::pos2(r.center().x, cy),
-                                        1.6,
-                                        Color32::from_rgb(150, 156, 166),
-                                    );
-                                }
-                                ui.label(RichText::new(format!("{}. {}", i + 1, cal)).strong());
-                            });
-                            ui.add_space(2.0);
-                            // 子弹网格：横向自动换行（替代原纯纵向长列），提升多子弹单屏可见性。
-                            if let Some(bullets) = app.info.get(&cal) {
-                                let mut bs: Vec<String> = bullets.keys().cloned().collect();
-                                bs.sort();
-                                ui.horizontal_wrapped(|ui| {
-                                    for b in &bs {
-                                        ui.vertical(|ui| {
-                                            ui.set_min_width(150.0);
-                                            ui.label(
-                                                RichText::new(b)
-                                                    .small()
-                                                    .strong()
-                                                    .color(Color32::from_rgba_unmultiplied(
-                                                        60, 68, 84, 255,
-                                                    )),
-                                            );
-                                            let entry = app
-                                                .buy_thresholds
-                                                .entry((cal.clone(), b.clone()))
-                                                .or_default();
-                                            let resp = ui.add(
-                                                egui::TextEdit::singleline(entry)
-                                                    .desired_width(118.0)
-                                                    .hint_text("最低接受价格"),
-                                            );
-                                            // 失焦即完成一次编辑：作为阈值持久化的干净提交点。
-                                            if resp.lost_focus() {
-                                                buy_dirty = true;
+                egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
+                    for cal in &app.buy_caliber_order {
+                        ui.label(RichText::new(cal).strong());
+                        if let Some(bullets) = app.info.get(cal) {
+                            let mut bs: Vec<String> = bullets.keys().cloned().collect();
+                            bs.sort();
+                            ui.horizontal_wrapped(|ui| {
+                                for b in &bs {
+                                    ui.vertical(|ui| {
+                                        ui.set_min_width(150.0);
+                                        ui.label(
+                                            RichText::new(b)
+                                                .small()
+                                                .strong()
+                                                .color(Color32::from_rgba_unmultiplied(
+                                                    60, 68, 84, 255,
+                                                )),
+                                        );
+                                        let key = (cal.clone(), b.clone());
+                                        // 默认显示 10000；若已持久化阈值则显示该阈值。
+                                        let default = app
+                                            .buy_thresholds
+                                            .get(&key)
+                                            .cloned()
+                                            .filter(|s| !s.is_empty())
+                                            .unwrap_or_else(|| "10000".to_string());
+                                        let buf =
+                                            app.buy_price_buffer.entry(key.clone()).or_insert(default);
+                                        let resp = ui.add(
+                                            egui::TextEdit::singleline(buf)
+                                                .desired_width(118.0)
+                                                .hint_text("最低接受价格"),
+                                        );
+                                        // 失焦才提交：改动后写入阈值并持久化（成为新的默认）；
+                                        // 留空或维持 10000 视为不设阈值（不触发自动购买）。
+                                        if resp.lost_focus() {
+                                            let t = buf.trim().to_string();
+                                            if t.is_empty() || t == "10000" {
+                                                app.buy_thresholds.remove(&key);
+                                            } else {
+                                                app.buy_thresholds.insert(key.clone(), t);
                                             }
-                                        });
-                                        ui.add_space(8.0);
-                                    }
-                                });
-                            }
-                        })
-                        .response;
-
-                    // 落点判定：拖拽进行中且指针悬停在本卡片矩形内（且非源卡）时记为落点。
-                    if app.drag_src.is_some() && app.drag_src != Some(i) {
-                        if let Some(p) = ui.ctx().input(|i| i.pointer.interact_pos()) {
-                            if card_resp.rect.contains(p) {
-                                app.drop_dst = Some(i);
-                            }
+                                            buy_dirty = true;
+                                        }
+                                    });
+                                    ui.add_space(8.0);
+                                }
+                            });
                         }
+                        ui.add_space(6.0);
                     }
-                    ui.add_space(8.0);
-                }
-                ui.label(
-                    RichText::new("对每个子弹填写「最低接受价格」（哈夫币）：观察时若某子弹价格低于该值，将进入购买界面、自动把所选数量调整到目标值并点击「购买」，完成后 ESC 返回扫描；价格回升或超阈值则只 ESC 返回、不购买。留空表示不设阈值。")
-                        .small()
-                        .color(Color32::from_rgba_unmultiplied(90, 100, 120, 200)),
-                );
+                });
             }
             if buy_toggled {
                 crate::persist_buy_cfg(app.buy_enabled, &app.buy_thresholds);
@@ -347,6 +304,14 @@ impl ControlPanel {
             ui.checkbox(&mut app.tour_mode, "导游模式（每步展示计划，回车确认后执行）");
             ui.label(
                 RichText::new("开启后，检索口径 / 进入购买 / 调整数量 / 确认购买等每一步会先以会议文字形式展示在毛玻璃导游层，按回车确认才执行；关闭则全自动运行（F9 随时中止）。")
+                    .small()
+                    .color(Color32::from_rgba_unmultiplied(90, 100, 120, 200)),
+            );
+            ui.add_space(4.0);
+
+            // 神经网络可视化触发方式改为「按住 F2」：松开即隐藏并暂停更新，不再用复选框常驻。
+            ui.label(
+                RichText::new("神经网络可视化：进入观察后「按住 F2」即可在游戏上方用矩形框 + 中文标签临时标注购买 / 加 / 减按钮；松开 F2 立即隐藏并停止检测更新。")
                     .small()
                     .color(Color32::from_rgba_unmultiplied(90, 100, 120, 200)),
             );

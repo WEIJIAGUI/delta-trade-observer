@@ -491,6 +491,170 @@ def train_button(args) -> None:
 
 
 # =========================================================================== #
+# 任务 3：购买界面布局二分类（layout）—— 方案 A（纯查表）
+# =========================================================================== #
+# 替代「按钮位置回归检测器」：神经网络只判定当前购买界面属于哪一种固定布局
+# （0 = 可兑换子弹 / 1 = 不可兑换子弹），按钮坐标直接写死查表（见 LAYOUTS），
+# 不再依赖模型回归定位。这彻底规避回归抖动，购买界面稳定。
+#
+# 预处理（与 Rust 端 src/domain/buttons.rs 必须完全一致）：
+#   原图裁剪右下角 (CROP_X0,CROP_Y0)-(CROP_X1,CROP_Y1) → 等比留边(letterbox) 256×256
+#   → /255 → NCHW。推理端(Rust)会按实际客户区尺寸自适应缩放裁剪框。
+
+LAYOUT_MODEL_PT = "layout.pt"
+LAYOUT_DEFAULT_ONNX = "layout.onnx"
+LAYOUT_INPUT_SIZE = 256              # 与 Rust 端 INPUT_SIZE 一致
+LAYOUT_CROP = (1433, 770, 1829, 970) # 标定视口(1920×1080)下的右下角裁剪框
+LAYOUT_NUM_CLASSES = 2               # 0=可兑换 / 1=不可兑换
+
+
+def buy_to_layout_label(buy):
+    """根据「购买」按钮 bbox 推导布局标签 0/1；无法判定返回 None。"""
+    if not buy:
+        return None
+    cx, cy = buy[0] + buy[2] / 2.0, buy[1] + buy[3] / 2.0
+    for i, ly in enumerate(LAYOUTS):
+        bx, by, bw, bh = ly["buy"]
+        bcx, bcy = bx + bw / 2.0, by + bh / 2.0
+        dist = ((cx - bcx) ** 2 + (cy - bcy) ** 2) ** 0.5
+        if dist < 40 and abs(buy[2] - bw) / bw < 0.15 and abs(buy[3] - bh) / bh < 0.15:
+            return i
+    # 退路：按 y 中心粗略二分（可兑换在上方 ~859，不可兑换在下方 ~917）。
+    return 1 if cy >= 888 else 0
+
+
+class LayoutClassifier(nn.Module):
+    """轻量 CNN 二分类：裁剪后的右下角图 → 布局 0/1（logits [1,2]）。"""
+
+    def __init__(self, in_ch: int = 3, num_classes: int = LAYOUT_NUM_CLASSES):
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(in_ch, 16, 3, padding=1), nn.ReLU(inplace=True), nn.MaxPool2d(2),
+            nn.Conv2d(16, 32, 3, padding=1), nn.ReLU(inplace=True), nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(inplace=True), nn.MaxPool2d(2),
+            nn.AdaptiveAvgPool2d((4, 4)),
+        )
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(64 * 4 * 4, 64), nn.ReLU(),
+            nn.Linear(64, num_classes),
+        )
+
+    def forward(self, x):
+        return self.classifier(self.features(x))
+
+
+def layout_preprocess(img: Image.Image):
+    """裁剪右下角 + 等比留边到 LAYOUT_INPUT_SIZE + /255 + NCHW（与 Rust 端一致）。
+
+    训练图均为 1920×1080 标定视口，裁剪框固定 LAYOUT_CROP。
+    """
+    cx0, cy0, cx1, cy1 = LAYOUT_CROP
+    crop = img.crop((cx0, cy0, cx1, cy1)).convert("RGB")
+    cw, ch = crop.size
+    scale = min(LAYOUT_INPUT_SIZE / cw, LAYOUT_INPUT_SIZE / ch)
+    sw, sh = max(round(cw * scale), 1), max(round(ch * scale), 1)
+    resized = crop.resize((sw, sh), Image.BILINEAR)
+    canvas = Image.new("RGB", (LAYOUT_INPUT_SIZE, LAYOUT_INPUT_SIZE), (0, 0, 0))
+    ox, oy = (LAYOUT_INPUT_SIZE - sw) // 2, (LAYOUT_INPUT_SIZE - sh) // 2
+    canvas.paste(resized, (ox, oy))
+    arr = (np.asarray(canvas, dtype=np.float32) / 255.0).transpose(2, 0, 1)
+    return arr[None, ...].astype(np.float32)
+
+
+class LayoutDataset(Dataset):
+    def __init__(self, data_root, annotations: str = "annotations.jsonl"):
+        self.root = data_root
+        path = os.path.join(data_root, annotations)
+        if not os.path.isfile(path):
+            raise SystemExit(f"未找到标注文件：{path}")
+        self.samples = []
+        bad = 0
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                obj = json.loads(line)
+                if "image" not in obj:
+                    continue
+                t = obj.get("targets", {})
+                buy = t.get("buy") if isinstance(t, dict) else obj.get("bbox")
+                label = buy_to_layout_label(buy)
+                if label is None:
+                    bad += 1
+                    continue
+                self.samples.append({"image": obj["image"], "label": label})
+        if bad:
+            print(f"[layout] 跳过 {bad} 条无法判定布局的样本")
+        print(f"[layout] 可用样本 {len(self.samples)}")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        obj = self.samples[idx]
+        img = Image.open(os.path.join(self.root, obj["image"])).convert("RGB")
+        x = torch.from_numpy(layout_preprocess(img)[0])
+        return x, obj["label"]
+
+
+def export_layout_onnx(model, out_path: str):
+    """导出布局二分类 ONNX（输出名 `logits` [1,2]，与 Rust 端一致）。"""
+    model.eval()
+    dummy = torch.randn(1, 3, LAYOUT_INPUT_SIZE, LAYOUT_INPUT_SIZE)
+    torch.onnx.export(
+        model,
+        dummy,
+        out_path,
+        input_names=["input"],
+        output_names=["logits"],
+        dynamic_axes={"input": {0: "batch"}, "logits": {0: "batch"}},
+        dynamo=False,
+    )
+    import onnx as _onnx
+    _onnx.checker.check_model(_onnx.load(out_path))
+    print(f"已导出 ONNX（已通过 checker 校验）：{out_path}")
+
+
+def train_layout(args) -> None:
+    model_pt = os.path.join(args.out_dir, LAYOUT_MODEL_PT)
+    onnx_path = os.path.join(args.out_dir, args.export_onnx or LAYOUT_DEFAULT_ONNX)
+
+    if args.only_export:
+        if not os.path.isfile(model_pt):
+            raise SystemExit(f"未找到 {model_pt}，请先训练或去掉 --only-export。")
+        model = LayoutClassifier()
+        model.load_state_dict(torch.load(model_pt, map_location="cpu"))
+        export_layout_onnx(model, onnx_path)
+        return
+
+    ds = LayoutDataset(args.data)
+    loader = DataLoader(ds, batch_size=args.batch_size, shuffle=True, num_workers=0)
+    model = LayoutClassifier()
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+
+    model.train()
+    for epoch in range(1, args.epochs + 1):
+        total, correct, loss_sum = 0, 0, 0.0
+        for xb, yb in loader:
+            optimizer.zero_grad()
+            out = model(xb)
+            loss = criterion(out, yb)
+            loss.backward()
+            optimizer.step()
+            loss_sum += loss.item() * xb.size(0)
+            correct += (out.argmax(dim=1) == yb).sum().item()
+            total += yb.size(0)
+        print(f"epoch {epoch:03d}  loss={loss_sum / total:.4f}  acc={correct / total:.4f}")
+
+    torch.save(model.state_dict(), model_pt)
+    print(f"已保存模型：{model_pt}")
+    export_layout_onnx(model, onnx_path)
+
+
+# =========================================================================== #
 # CLI
 # =========================================================================== #
 def build_parser() -> argparse.ArgumentParser:
@@ -528,6 +692,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_button.add_argument("--export-onnx", default=BUTTON_DEFAULT_ONNX, help="训练完成后导出的 ONNX 文件名（相对 --out-dir）")
     p_button.add_argument("--only-export", action="store_true", help="仅导出 ONNX（需已存在 buttons.pt）")
 
+    # —— layout 子命令（方案 A：购买界面布局二分类，坐标纯查表）——
+    p_layout = sub.add_parser("layout", help="购买界面布局二分类训练（方案A：纯查表）")
+    p_layout.add_argument("--data", default=BUTTON_DATASET_DIR, help="数据集根目录（含 annotations.jsonl 与 images/）")
+    p_layout.add_argument("--out-dir", default=HERE, help="模型输出目录（默认当前目录）")
+    p_layout.add_argument("--epochs", type=int, default=20)
+    p_layout.add_argument("--batch-size", type=int, default=32)
+    p_layout.add_argument("--lr", type=float, default=1e-3)
+    p_layout.add_argument("--export-onnx", default=LAYOUT_DEFAULT_ONNX, help="训练完成后导出的 ONNX 文件名（相对 --out-dir）")
+    p_layout.add_argument("--only-export", action="store_true", help="仅导出 ONNX（需已存在 layout.pt）")
+
     return parser
 
 
@@ -537,6 +711,8 @@ def main() -> None:
     task = args.task or "digit"  # 无子命令时默认 digit，兼容旧调用 `python train.py`
     if task == "digit":
         train_digit(args)
+    elif task == "layout":
+        train_layout(args)
     else:
         train_button(args)
 
@@ -549,3 +725,6 @@ if __name__ == "__main__":
 # python train.py button --data button_dataset --epochs 30 --batch-size 16 --lr 1e-3
 #   -> 三分类（buy/minus/plus）检测器，输出 buttons.pt + buttons.onnx
 #   -> 推理示例见 predict_layout.py：python predict_layout.py shot.png --model buttons.onnx
+# python train.py layout --data button_dataset --epochs 20 --export-onnx layout.onnx
+#   -> 方案A：购买界面布局二分类（0=可兑换/1=不可兑换），坐标纯查表，输出 layout.pt + layout.onnx
+#   -> Rust 端改为加载 layout.onnx（见 src/domain/buttons.rs），下游按 scene 查表坐标

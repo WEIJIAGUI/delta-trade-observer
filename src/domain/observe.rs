@@ -26,7 +26,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use windows::Win32::System::SystemInformation::GetSystemTime;
 
-use crate::config::{CALIB_VIEWPORT_W, Config, GAME_KEYWORD, Rect, Scale, SEARCH_BAR};
+use crate::config::{BulletRects, CALIB_VIEWPORT_W, Config, GAME_KEYWORD, Scale, SEARCH_BAR};
 use crate::digit::PriceRec;
 use crate::recognition::BulletRecognition;
 use crate::buy;
@@ -157,6 +157,30 @@ fn resolve_caliber_order(preferred: &[String], info: &Config) -> Vec<String> {
     out
 }
 
+/// 解析口径内子弹处理顺序：优先采用 UI 拖拽调整的 `preferred`（与校准配置求交集，剔除已移除子弹），
+/// 缺失子弹按网格阅读顺序（名称条坐标 `y → x` 行优先）补入，保证确定性与可视化一致。
+/// 空 `preferred` 列表时 `out` 为空、全部走补尾分支，等价于旧版「网格阅读顺序」，向后兼容。
+/// 与 [`resolve_caliber_order`] 对称：口径级与子弹级共用同一套「用户顺序优先 + 配置补尾」逻辑。
+fn resolve_bullet_order(preferred: &[String], bullets: &HashMap<String, BulletRects>) -> Vec<String> {
+    let mut out: Vec<String> = preferred
+        .iter()
+        .filter(|b| bullets.contains_key(*b))
+        .cloned()
+        .collect();
+    let mut missing: Vec<String> = bullets
+        .keys()
+        .filter(|b| !preferred.contains(b))
+        .cloned()
+        .collect();
+    missing.sort_by(|a, b| {
+        let ra = &bullets[a].name;
+        let rb = &bullets[b].name;
+        ra[1].cmp(&rb[1]).then(ra[0].cmp(&rb[0]))
+    });
+    out.extend(missing);
+    out
+}
+
 /// 观察主流程（后台线程执行，通过 `tx` 回传进度/完成，通过 `stop` 支持优雅中止）。
 ///
 /// `interval_min`：轮间等待分钟数（每轮遍历全部口径结束后等待该时长再开始下一轮）。
@@ -185,6 +209,10 @@ pub fn run_observation(
     // 购买口径处理顺序（口径级）：UI 拖拽调整后的口径顺序；运行期与校准配置求交集并补尾，
     // 保证「配置新增的口径不会漏处理、已移除的口径不会误检索」。空列表回退到口径名排序。
     buy_caliber_order: Vec<String>,
+    // 购买口径内子弹处理顺序（子弹级，对称于口径级）：口径 -> 有序子弹列表；运行期与校准配置
+    // 对账（剔移除、补缺失按网格阅读顺序），同时驱动「扫描识别」与「购买判定」两个分支，
+    // 保证观察与购买共用同一子弹顺序。空表回退到网格阅读顺序。
+    buy_bullet_order: HashMap<String, Vec<String>>,
     // 导游模式协调器：每口径检索前展示计划并等待回车确认；关闭态（`Tour::disabled`）下为无操作。
     tour: Tour,
 ) {
@@ -281,6 +309,7 @@ pub fn run_observation(
             }
         }
         let mut fail_streak = 0usize;
+        crate::log::event("OBSERVE", "cycle", &format!("\"cycle\":{},\"total_cal\":{}", cycle, total_cal));
 
         for (ci, cal) in calibers.iter().enumerate() {
             if stop.load(Ordering::Relaxed) {
@@ -288,6 +317,7 @@ pub fn run_observation(
             }
             // 导游模式：进入该口径检索前先展示计划并等待回车确认（关闭态为无操作）。
             tour.ask(&format!("【计划】开始检索「{cal}」口径子弹"));
+            crate::log::event("OBSERVE", "caliber", &format!("\"cycle\":{},\"idx\":{},\"total\":{},\"caliber\":\"{}\"", cycle, ci, total_cal, cal));
             if stop.load(Ordering::Relaxed) {
                 break 'cycles;
             }
@@ -319,17 +349,29 @@ pub fn run_observation(
                 Some(b) => b,
                 None => continue,
             };
-            // 固定子弹扫描顺序：按名称条坐标 (y 行 → x 列) 行优先排序，
-            // 即「从上到下、同行从左到右」逐格识别，对应交易行 3×3 网格的阅读顺序。
-            let mut bullet_order: Vec<_> = bullets.iter().collect();
-            bullet_order.sort_by(|a, b| {
-                let ra = &a.1.name;
-                let rb = &b.1.name;
-                ra[1].cmp(&rb[1]).then(ra[0].cmp(&rb[0]))
-            });
+            // 口径内子弹处理顺序：优先采用 UI 拖拽调整的 `buy_bullet_order`（与校准配置求交集、剔除已移除），
+            // 空顺序或缺失子弹时回退到「网格阅读顺序」（名称条坐标 y → x 行优先），向后兼容。
+            // 该顺序同时驱动「扫描识别」与「购买判定」两个分支（同一循环），保证观察与购买一致。
+            let bullet_names: Vec<String> = match buy_bullet_order.get(cal) {
+                Some(pref) => resolve_bullet_order(pref, bullets),
+                None => {
+                    let mut v: Vec<String> = bullets.keys().cloned().collect();
+                    v.sort_by(|a, b| {
+                        let ra = &bullets[a].name;
+                        let rb = &bullets[b].name;
+                        ra[1].cmp(&rb[1]).then(ra[0].cmp(&rb[0]))
+                    });
+                    v
+                }
+            };
 
             // 4) 逐单元格：名称 + 价格统一走共享识别器（OCR 测试 Tab 复用同一逻辑，见 `recognition` 模块）
-            for (bullet, rects) in bullet_order {
+            for bullet in bullet_names {
+                let rects = match bullets.get(&bullet) {
+                    Some(r) => r,
+                    None => continue,
+                };
+                let bullet: &str = &bullet;
                 if stop.load(Ordering::Relaxed) {
                     break 'cycles;
                 }
@@ -427,7 +469,7 @@ pub fn run_observation(
                 if buy_enabled {
                     // 进入本轮子弹的购买判定前，清空上一颗子弹残留的购买展示（价格/场景/数量）。
                     let _ = tx.send(ObserveMsg::BuyCleared);
-                    let th = buy_thresholds.get(&(cal.clone(), bullet.clone())).copied();
+                    let th = buy_thresholds.get(&(cal.clone(), bullet.to_string())).copied();
                     match                         buy::verify_then_decide(
                             hwnd,
                             &scale,
@@ -463,6 +505,7 @@ pub fn run_observation(
                             // toast（可能点击静默失败）仅记日志，不影响主流程，随后照常 ESC 返回扫描。
                             match crate::toast::monitor_after_buy(hwnd, &stop) {
                                 Some(kind) => {
+                                    crate::log::event("TOAST", "result", &format!("\"kind\":\"{}\"", kind.label()));
                                     crate::log::write(&format!("[BUY] 购买结果：{}", kind.label()));
                                     let _ = tx.send(ObserveMsg::BuyResultNotice {
                                         label: kind.label().to_string(),
@@ -478,6 +521,7 @@ pub fn run_observation(
                                     tour.ask(tip);
                                 }
                                 None => {
+                                    crate::log::event("TOAST", "result", "\"kind\":\"none\"");
                                     crate::log::write(
                                         "[BUY][WARN] 未捕获到购买成功 toast（点击可能未生效），本次购买结果未知",
                                     );
@@ -488,8 +532,17 @@ pub fn run_observation(
                                     tour.ask("【购买结果】未捕获到成功提示（点击可能未生效），按 Enter 继续");
                                 }
                             }
-                            win::send_esc();
+                            // 关键修复：必须「先 focus_window 再 send_esc」。
+                            // 键盘 SendInput 只投递到前台窗口；购买流程长（数量调整多次点击
+                            // + 3s toast 监听），本程序置顶面板 AlwaysOnTop，焦点极易不在游戏
+                            // 窗口，若先 send_esc，ESC 会丢给其它窗口，游戏收不到 → 界面停留在
+                            // 上一颗子弹的购买页（视觉上就像未触发 ESC）。先交还焦点再发 ESC，
+                            // 才能可靠关闭购买界面、返回子弹列表并推进下一颗。
                             win::focus_window(hwnd);
+                            win::send_esc();
+                            // 留给游戏界面切换动画，避免下一颗子弹的「打开购买界面」点击落在
+                            // 上一个购买界面的过渡态上（点空 → 卡在上一颗子弹）。
+                            std::thread::sleep(Duration::from_millis(250));
                         }
                         buy::BuyDecision::Abort { scene } => {
                             // 购买界面场景判定：渲染到毛玻璃面板（仅展示，不弹提示框）。
@@ -499,8 +552,17 @@ pub fn run_observation(
                                 });
                             }
                             // 重验证后价格未低于阈值（或已回升）→ ESC 返回扫描，不购买。
-                            win::send_esc();
+                            // 关键修复：必须「先 focus_window 再 send_esc」。
+                            // 键盘 SendInput 只投递到前台窗口；购买流程长（数量调整多次点击
+                            // + 3s toast 监听），本程序置顶面板 AlwaysOnTop，焦点极易不在游戏
+                            // 窗口，若先 send_esc，ESC 会丢给其它窗口，游戏收不到 → 界面停留在
+                            // 上一颗子弹的购买页（视觉上就像未触发 ESC）。先交还焦点再发 ESC，
+                            // 才能可靠关闭购买界面、返回子弹列表并推进下一颗。
                             win::focus_window(hwnd);
+                            win::send_esc();
+                            // 留给游戏界面切换动画，避免下一颗子弹的「打开购买界面」点击落在
+                            // 上一个购买界面的过渡态上（点空 → 卡在上一颗子弹）。
+                            std::thread::sleep(Duration::from_millis(250));
                         }
                         buy::BuyDecision::Skip => {}
                     }
@@ -541,7 +603,7 @@ pub fn run_observation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{BulletRects, Config};
+    use crate::config::{BulletRects, Config, Rect};
 
     fn rect() -> Rect {
         [0, 0, 10, 10]

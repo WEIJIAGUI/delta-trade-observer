@@ -30,12 +30,13 @@ mod tour;
 pub use tour::Tour;
 mod ui;
 pub use ui::{
-    theme, control_panel, floating_panel, ocr_test_panel, price_viz_panel, qty_tool_panel,
+    theme, control_panel, floating_panel, tour_guide_panel, ocr_test_panel, price_viz_panel,
+    qty_tool_panel, order_page,
 };
 pub use ui::price_viz_panel as price_viz;
 
 use eframe::egui::viewport::{ViewportCommand, WindowLevel};
-use eframe::egui::{self, Color32, Context, Frame, ViewportBuilder};
+use eframe::egui::{self, Color32, Context, ViewportBuilder};
 use eframe::App;
 
 use global_hotkey::GlobalHotKeyEvent;
@@ -55,10 +56,10 @@ use std::sync::mpsc;
 const SELF_TITLE: &str = "交易行物价观察器";
 /// 主控制面板（Idle 态）窗口尺寸（固定 1200×600，不可缩放）。
 const IDLE_SIZE: (f32, f32) = (1200.0, 600.0);
-/// 毛玻璃悬浮面板（激活态）窗口尺寸。
-const FLOAT_SIZE: (f32, f32) = (320.0, 256.0);
-/// 导游模式开启时的激活态窗口尺寸（更大，以容纳毛玻璃导游层与会议文字计划）。
-const TOUR_FLOAT_SIZE: (f32, f32) = (500.0, 380.0);
+/// 激活态毛玻璃面板固定宽度（px）：状态面板与导游面板共用，宽度恒定不再随窗口变化。
+/// 关键：面板宽度写死后，`content_right` 恒定，自适应窗口尺寸逻辑只下发一次即稳定，
+/// 杜绝「窗口撑开 → 面板填充 → 再撑开」的正反馈宽度自增与闪烁。
+pub(crate) const FLOAT_W: f32 = 320.0;
 
 /// 程序运行状态。
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -75,6 +76,15 @@ pub(crate) enum MainTab {
     OcrTest, // OCR 测试（本地图片 + 口径 → 复用识别逻辑）
     PriceViz, // 价格可视化（口径 → 子弹 → 最近 24h 价格折线）
     QtyTool, // 数量采集工具（采集购买界面数量数位截图 + 点击加号）
+}
+
+/// 全屏窗口下的顶层页面（页面切换取代原先的模态弹窗）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Page {
+    /// 主面板（四个 Tab）。
+    Main,
+    /// 顺序调整页：左栏口径（20%）+ 右栏子弹（80%），两侧独立拖拽排序。
+    OrderAdjust,
 }
 
 /// 存档配置文件路径（位于可执行文件同目录），用于持久化识别结果保存目录。
@@ -146,6 +156,44 @@ pub(crate) fn persist_buy_order(order: &[String]) {
             .iter()
             .map(|c| format!("{}\n", c))
             .collect::<String>();
+        let _ = std::fs::write(&p, out);
+    }
+}
+
+/// 购买口径内子弹处理顺序配置文件路径（与 `buy.cfg` 同目录）：每行 `口径|子弹`，
+/// 记录 UI 拖拽调整后的「口径 -> 有序子弹列表」。
+fn buy_bullet_order_path() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    Some(dir.join("buy_bullet_order.txt"))
+}
+
+/// 读取持久化的购买口径内子弹处理顺序（每行 `口径|子弹`）。文件不存在或为空时返回空表，
+/// 表示回退到「网格阅读顺序」默认顺序；加载时不做与校准配置的校验（运行期再剔除/补尾）。
+pub(crate) fn load_bullet_order() -> HashMap<String, Vec<String>> {
+    let mut map: HashMap<String, Vec<String>> = HashMap::new();
+    if let Some(p) = buy_bullet_order_path() {
+        if let Ok(s) = std::fs::read_to_string(&p) {
+            for line in s.lines() {
+                let line = line.trim();
+                if let Some((cal, bullet)) = line.split_once('|') {
+                    map.entry(cal.to_string()).or_default().push(bullet.to_string());
+                }
+            }
+        }
+    }
+    map
+}
+
+/// 持久化购买口径内子弹处理顺序（每行 `口径|子弹`）。仅在拖拽落定后调用，不逐帧写盘。
+pub(crate) fn persist_bullet_order(order: &HashMap<String, Vec<String>>) {
+    if let Some(p) = buy_bullet_order_path() {
+        let mut out = String::new();
+        for (cal, bullets) in order {
+            for b in bullets {
+                out.push_str(&format!("{}|{}\n", cal, b));
+            }
+        }
         let _ = std::fs::write(&p, out);
     }
 }
@@ -259,10 +307,30 @@ pub(crate) struct ObserverApp {
     /// （前置口径全部子弹处理完后）依次处理。由 UI 拖拽调整并持久化；校准配置新增/移除的口径
     /// 会自动并入列表尾/剔除。空列表表示回退到「口径名排序」默认顺序。
     pub(crate) buy_caliber_order: Vec<String>,
-    /// 拖拽排序临时状态：当前被拖拽的口径卡片索引（None = 未拖拽）。
+    /// 购买口径内子弹处理顺序（口径级，对称于 `buy_caliber_order`）：口径 -> 有序子弹列表。
+    /// 由口径顺序模态内的「子弹调整」子模态拖拽调整并持久化；与校准配置对账（剔移除、补缺失）后，
+    /// 同时驱动「扫描识别」与「购买判定」，保证观察与购买共用同一子弹顺序。空表 = 回退网格阅读顺序。
+    pub(crate) buy_bullet_order: HashMap<String, Vec<String>>,
+    /// 拖拽排序临时状态：当前被拖拽的卡片索引（None = 未拖拽）。
     pub(crate) drag_src: Option<usize>,
-    /// 拖拽排序临时状态：当前悬停（落点）的口径卡片索引（None = 无落点）。
+    /// 拖拽排序临时状态：当前悬停（落点）的卡片索引（None = 无落点）。
     pub(crate) drop_dst: Option<usize>,
+    /// 拖拽作用域（顺序调整页左右两栏共用一套拖拽状态，以此区分互不干扰）：
+    /// `Some(0)` = 左栏口径列表，`Some(1)` = 右栏子弹网格。
+    pub(crate) drag_scope: Option<u8>,
+    /// 顶层页面（页面切换取代模态弹窗）。
+    pub(crate) page: Page,
+    /// 顺序调整页：左栏当前选中的口径（右栏联动展示该口径的子弹）。
+    pub(crate) order_selected_caliber: Option<String>,
+    /// 拖拽排序临时状态：浮动预览当前指针位置（用于「移动」动画的平滑跟随）。
+    pub(crate) drag_pointer: Option<egui::Pos2>,
+    /// 各子弹最低接受价格输入框的编辑缓冲（显示文本，默认 "10000"；失焦才提交到 `buy_thresholds`）。
+    /// 与 `buy_thresholds` 解耦：未改动的子弹显示 10000 但不写入阈值（不触发自动购买），改动后持久化。
+    pub(crate) buy_price_buffer: HashMap<(String, String), String>,
+    /// 拖拽落定后的「吸附」高亮目标卡片索引（松开动画用，None=无）。
+    pub(crate) drag_snap_target: Option<usize>,
+    /// 拖拽吸附高亮起始时间（`ctx.time()`，用于松开后高亮淡出）。
+    pub(crate) drag_snap_t0: Option<f64>,
     /// 导游模式开关：开启后，观察过程中每一步操作（检索口径 / 进入购买 / 调整数量 / 确认购买等）
     /// 会先以会议文字形式展示在毛玻璃导游层，使用者回车确认后才执行；关闭则全自动运行。
     pub(crate) tour_mode: bool,
@@ -270,8 +338,22 @@ pub(crate) struct ObserverApp {
     /// `confirm` 放行。由「开始观察」按 `tour_mode` 构造（开启 `Tour::new` / 关闭 `Tour::disabled`），
     /// 整个观察周期内与后台线程共享同一份「待确认计划」与「确认信号」。
     pub(crate) tour: Tour,
+    /// 神经网络可视化：最近一次检测结果缓存（游戏客户区坐标）与采集时间戳（egui `ctx.time`），用于节流重推理。
+    /// 触发方式：按住 F2 期间（`hotkey_hook::f2_held`）才渲染并显示，松开即隐藏并暂停更新。
+    nn_viz_cache: Option<crate::buttons::ButtonDet>,
+    nn_viz_t0: f64,
     /// CJK 字体是否已安装（仅首次 update 安装一次）。
     font_ready: bool,
+    /// Idle 主面板全屏是否已同步过一次：创建期 `with_fullscreen` 在 Windows 上不可靠，
+    /// 改为首个 Idle 帧用 `ViewportCommand::Fullscreen(true)` 命令触发（与 `stop` 恢复同机制）。
+    idle_fullscreen_done: bool,
+    /// 激活态毛玻璃：后台桌面采集控制器（DXGI Desktop Duplication），持续产出模糊桌面帧。
+    /// 取代原先的 `DwmEnableBlurBehindWindow`（在 swapchain 透明窗口上会合成黑屏）。
+    blur_capture: Option<crate::platform::dxgi_capture::BlurCapture>,
+    /// 由 `blur_capture` 最新一帧上传得到的 egui 纹理（全屏模糊桌面），面板按需裁切为自身底图。
+    blur_tex: Option<egui::TextureHandle>,
+    /// 上一帧屏幕矩形（egui 逻辑坐标），用于将面板屏幕坐标映射到 `blur_tex` 的 UV 区间。
+    last_screen_rect: Option<egui::Rect>,
     /// 口径配置（代码化，见 `config` 模块）：口径 -> 子弹名 -> 区域坐标。
     pub(crate) info: Arc<Config>,
     /// 全局快捷键管理器（必须存活于整个程序生命周期）。
@@ -298,6 +380,9 @@ pub(crate) struct ObserverApp {
     pub(crate) ocr_test_digit_sel: usize,
     /// OCR 测试 Tab：当前选中子弹各个数位的裁剪图纹理（千/百/十/个，缺位为 None）。
     pub(crate) ocr_test_digit_tex: Vec<Option<egui::TextureHandle>>,
+    /// 顺序调整页：子弹贴图纹理缓存（`assets/bullets/<子弹key>.png`，key 对应 `config.rs` 子弹名）。
+    /// 惰性加载、进程内复用，避免每帧重复上传 GPU。
+    pub(crate) bullet_textures: HashMap<String, egui::TextureHandle>,
     /// 价格可视化 Tab 的全部界面状态（含 records.jsonl 缓存，见 `price_viz` 模块）。
     pub(crate) viz: price_viz::VizState,
     /// 数量采集工具：场景来源选择（0=自动检测 / 1=可兑换子弹 / 2=不可兑换子弹）。
@@ -349,11 +434,25 @@ impl ObserverApp {
             buy_thresholds,
             buy_qty: 31,
             buy_caliber_order: load_buy_order(),
+            buy_bullet_order: load_bullet_order(),
             drag_src: None,
             drop_dst: None,
+            drag_scope: None,
+            page: Page::Main,
+            order_selected_caliber: None,
+            drag_pointer: None,
+            buy_price_buffer: HashMap::new(),
+            drag_snap_target: None,
+            drag_snap_t0: None,
             tour_mode: false,
             tour: Tour::disabled(),
+            nn_viz_cache: None,
+            nn_viz_t0: 0.0,
             font_ready: false,
+            idle_fullscreen_done: false,
+            blur_capture: None,
+            blur_tex: None,
+            last_screen_rect: None,
             info,
             _manager: manager,
             f9_id,
@@ -367,6 +466,7 @@ impl ObserverApp {
             ocr_test_digit_seq: 0,
             ocr_test_digit_sel: usize::MAX,
             ocr_test_digit_tex: Vec::new(),
+            bullet_textures: HashMap::new(),
             viz: {
                 let mut v = price_viz::VizState::default();
                 v.caliber = "12 Gauge".to_string();
@@ -424,6 +524,8 @@ impl ObserverApp {
     /// 「开始观察」与「数量采集」工具共用此入口，避免重复的视口命令堆叠。
     fn enter_active_mode(&mut self, ctx: &Context, status: &str) {
         self.mode = Mode::Active;
+        // 离开 Idle：复位全屏同步标记，回到主面板时重新用命令触发全屏（避免首帧命令偶发未生效）。
+        self.idle_fullscreen_done = false;
         self.error = None;
         self.status = status.to_string();
         self.buy_price = None;
@@ -432,21 +534,25 @@ impl ObserverApp {
         self.buy_result = None;
 
         ctx.send_viewport_cmd(ViewportCommand::WindowLevel(WindowLevel::AlwaysOnTop));
+        ctx.send_viewport_cmd(ViewportCommand::Fullscreen(false));
         ctx.send_viewport_cmd(ViewportCommand::Decorations(false));
-        // 激活态保持鼠标穿透，不遮挡游戏操作（面板仅作状态展示）。
+        // 激活态保持鼠标穿透，不遮挡游戏操作（面板仅作状态展示，且窗口覆盖全屏）。
         ctx.send_viewport_cmd(ViewportCommand::MousePassthrough(true));
 
-        // 激活态窗口尺寸：导游模式开启时用更大尺寸，以容纳毛玻璃导游层与会议文字计划。
-        let float_size = if self.tour_mode { TOUR_FLOAT_SIZE } else { FLOAT_SIZE };
-        ctx.send_viewport_cmd(ViewportCommand::InnerSize(egui::vec2(float_size.0, float_size.1)));
+        // 激活态窗口覆盖全屏（透明、穿透），两个面板以独立 Area 锚定屏幕左上 / 右上角；
+        // 毛玻璃底图由后台桌面采集（DXGI Desktop Duplication）持续产出，见 `start_blur_capture`。
+        // 一次性下发尺寸 / 位置，避免每帧 resize 引发窗口抖动 / 事件循环被 WM 消息淹没。
         let screen = ctx.input(|i| i.screen_rect);
-        let x = screen.max.x - float_size.0 - 24.0;
-        let y = 24.0;
-        ctx.send_viewport_cmd(ViewportCommand::OuterPosition(egui::pos2(x, y)));
+        if screen.width() > 0.0 && screen.height() > 0.0 {
+            ctx.send_viewport_cmd(ViewportCommand::InnerSize(screen.size()));
+            ctx.send_viewport_cmd(ViewportCommand::OuterPosition(screen.min));
+        }
+
+        // 启动后台桌面采集（替代原先的 DWM 局部模糊，后者在 swapchain 透明窗口上会黑屏）。
+        self.start_blur_capture();
 
         if let Some(my_hwnd) = win::find_window_by_keyword(SELF_TITLE) {
             win::set_exclude_from_capture(my_hwnd, true);
-            win::set_window_blur(my_hwnd, true);
         }
     }
 
@@ -471,6 +577,12 @@ impl ObserverApp {
         self.mode = Mode::Idle;
         self.status.clear();
         self.error = None;
+        // 停止后台桌面采集并释放纹理（主面板不需要毛玻璃底图）。
+        if let Some(mut cap) = self.blur_capture.take() {
+            cap.stop();
+        }
+        self.blur_tex = None;
+        self.last_screen_rect = None;
 
         // 复位数量采集状态（后台线程随后仍会发 Done，此处先清避免面板残留）。
         self.qty_tool_running = false;
@@ -481,13 +593,43 @@ impl ObserverApp {
         ctx.send_viewport_cmd(ViewportCommand::WindowLevel(WindowLevel::Normal));
         ctx.send_viewport_cmd(ViewportCommand::Decorations(true));
         ctx.send_viewport_cmd(ViewportCommand::MousePassthrough(false));
-        ctx.send_viewport_cmd(ViewportCommand::InnerSize(egui::vec2(IDLE_SIZE.0, IDLE_SIZE.1)));
+        // 恢复全屏主面板（主面板即为全屏形态；悬浮态曾退出全屏，这里复原）。
+        ctx.send_viewport_cmd(ViewportCommand::Fullscreen(true));
         ctx.send_viewport_cmd(ViewportCommand::Focus);
 
         if let Some(my_hwnd) = win::find_window_by_keyword(SELF_TITLE) {
             win::set_exclude_from_capture(my_hwnd, false);
-            win::set_window_blur(my_hwnd, false);
         }
+    }
+
+    /// 启动 / 重启后台桌面采集（毛玻璃底图源）。若已有采集线程则先停后启，避免重复线程。
+    fn start_blur_capture(&mut self) {
+        if let Some(mut cap) = self.blur_capture.take() {
+            cap.stop();
+        }
+        if let Some(hwnd) = win::find_window_by_keyword(SELF_TITLE) {
+            self.blur_capture =
+                Some(crate::platform::dxgi_capture::BlurCapture::start(hwnd));
+        }
+    }
+
+    /// 返回当前毛玻璃纹理（供状态 / 导游面板绘制半透明底图）；尚未就绪时为 `None`。
+    pub(crate) fn blur_tex(&self) -> Option<egui::TextureHandle> {
+        self.blur_tex.clone()
+    }
+
+    /// 把面板在屏幕上的矩形坐标映射到全屏毛玻璃纹理的 UV 区间（0..1）。
+    /// 返回 `Rect::ZERO..ONE` 表示「无屏幕基准，退化为整张纹理」。
+    pub(crate) fn blur_uv(&self, rect: egui::Rect) -> egui::Rect {
+        let screen = match self.last_screen_rect {
+            Some(s) => s,
+            None => return egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+        };
+        let u0 = rect.min.x / screen.width();
+        let v0 = rect.min.y / screen.height();
+        let u1 = rect.max.x / screen.width();
+        let v1 = rect.max.y / screen.height();
+        egui::Rect::from_min_max(egui::pos2(u0, v0), egui::pos2(u1, v1))
     }
 
     /// 启动后台观察线程：遍历 config.rs 所有口径，逐一检索 + OCR 抓取价格并持久化。
@@ -511,6 +653,9 @@ impl ObserverApp {
         let buy_qty = self.buy_qty;
         // 购买口径处理顺序：透传给后台观察线程，控制各口径的先后处理顺序（缺漏口径运行期补尾）。
         let buy_caliber_order = self.buy_caliber_order.clone();
+        // 购买口径内子弹处理顺序：与口径顺序对称透传，控制各口径内子弹的先后处理顺序
+        // （缺漏子弹运行期按网格阅读顺序补尾），保证观察与购买共用同一子弹顺序。
+        let buy_bullet_order = self.buy_bullet_order.clone();
         // 导游模式：按开关构造协调器（开启 `Tour::new` / 关闭 `Tour::disabled`），
         // 后台线程经其 `ask` 展示计划并等待确认；UI 经 App 持有的 `tour` 渲染导游层并 `confirm` 放行。
         let tour = if self.tour_mode {
@@ -550,6 +695,7 @@ impl ObserverApp {
                 buy_ui_save_path,
                 buy_qty,
                 buy_caliber_order,
+                buy_bullet_order,
                 tour,
             );
         });
@@ -757,6 +903,76 @@ impl ObserverApp {
                 }
             }
         }
+        }
+
+    /// 神经网络可视化：在游戏上方透明、可穿透的图层（即本程序激活态全屏窗口）标注检测结果。
+    ///
+    /// **触发方式**：仅当用户按住 F2 键（`hotkey_hook::f2_held` 为真）时才渲染并显示；
+    /// 松开 F2 后本函数直接返回——既不绘制（立即隐藏）也不重推理（暂停更新，零额外开销），
+    /// 不影响程序其余逻辑。按住期间复用 `buttons::detect_buttons_from_frame` 跑布局二分类检测器，
+    /// 节流约 200ms 重推理一次，将查表坐标（游戏客户区）经 `win::client_rect_to_screen` 转屏幕坐标后，
+    /// 用矩形框 + 中文标签绘制（购买 / 加 / 减按钮）。
+    fn draw_nn_viz(&mut self, ctx: &Context) {
+        if !hotkey_hook::f2_held() {
+            return;
+        }
+        let Some(hwnd) = win::find_window_by_keyword(crate::config::GAME_KEYWORD) else {
+            return;
+        };
+        // 节流：每 ~200ms 重新推理一次，期间复用缓存，避免每帧跑 ONNX 拖慢界面。
+        let now = ctx.input(|i| i.time);
+        let need = self.nn_viz_cache.is_none() || (now - self.nn_viz_t0) > 0.2;
+        if need {
+            if let Ok(cap) = crate::screenshot::ClientCapturer::new(hwnd).capture() {
+                let scale = crate::config::Scale::for_client_width(cap.width);
+                if let Some(det) = buttons::detect_buttons_from_frame(&cap, &scale) {
+                    self.nn_viz_cache = Some(det);
+                    self.nn_viz_t0 = now;
+                }
+            }
+        }
+        let det = match &self.nn_viz_cache {
+            Some(d) => d,
+            None => return,
+        };
+        let screen = ctx.input(|i| i.screen_rect);
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("nn_viz_layer"),
+        ));
+        // 游戏客户区矩形 → egui 逻辑坐标（激活态窗口 OuterPosition = 屏幕原点、InnerSize = 屏幕尺寸，
+        // 故 egui 坐标 ≈ 屏幕坐标，减去 screen.min 以兼容多显示器偏移）。
+        let to_egui = |r: [i32; 4]| -> Option<egui::Rect> {
+            let s = win::client_rect_to_screen(hwnd, r)?;
+            Some(egui::Rect::from_min_max(
+                egui::pos2(s[0] as f32 - screen.min.x, s[1] as f32 - screen.min.y),
+                egui::pos2(
+                    s[0] as f32 + s[2] as f32 - screen.min.x,
+                    s[1] as f32 + s[3] as f32 - screen.min.y,
+                ),
+            ))
+        };
+        let draw_box = |painter: &egui::Painter, rect: [i32; 4], color: Color32, label: &str| {
+            if let Some(r) = to_egui(rect) {
+                painter.rect_stroke(r, 6.0, egui::Stroke::new(3.0, color));
+                painter.text(
+                    r.min + egui::vec2(2.0, -16.0),
+                    egui::Align2::LEFT_BOTTOM,
+                    label,
+                    egui::FontId::proportional(14.0),
+                    color,
+                );
+            }
+        };
+        if let Some(b) = det.buy {
+            draw_box(&painter, b, Color32::from_rgb(255, 80, 80), "购买按钮");
+        }
+        if let Some(m) = det.minus {
+            draw_box(&painter, m, Color32::from_rgb(255, 200, 60), "减按钮");
+        }
+        if let Some(p) = det.plus {
+            draw_box(&painter, p, Color32::from_rgb(80, 220, 120), "加按钮");
+        }
     }
 }
 
@@ -778,76 +994,143 @@ impl App for ObserverApp {
         self.poll_observe(ctx);
         self.poll_qty_tool(ctx);
 
-        // 导游模式：若有待确认计划，聚焦本窗口以接收回车（避免回车泄漏到游戏），
-        // 并检测回车确认放行。仅当存在待确认计划时才抢焦点，确认后由后台线程在下一步动作前交还游戏焦点。
-        if self.tour.pending_text().is_some() {
-            ctx.send_viewport_cmd(ViewportCommand::Focus);
-            if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
-                self.tour.confirm();
-            }
-        }
+        // 导游模式确认：Enter 由低级键盘钩子（hotkey_hook）在系统层捕获并调用 `Tour::confirm`，
+        // 无需抢焦点——抢焦点会让透明穿透窗口变前台、DWM 合成黑屏（旧实现的根因）。
+        // 此处仅把当前 `Tour` 引用刷给钩子（处理 Re-observe 重建 Tour 的情况）。
+        hotkey_hook::set_tour(self.tour.clone());
 
         match self.mode {
             Mode::Idle => {
+                // 首帧才用命令触发全屏（创建期 with_fullscreen 在 Windows 不可靠）：
+                // 让主面板真正填满屏幕，而非落在左上角的小窗。后续进入/退出观察态由
+                // enter_active_mode / stop 经 Fullscreen 命令维护。
+                if !self.idle_fullscreen_done {
+                    ctx.send_viewport_cmd(ViewportCommand::Fullscreen(true));
+                    self.idle_fullscreen_done = true;
+                }
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    ui.vertical(|ui| {
-                        // Tab 切换栏：各 Tab 界面与处理逻辑相互独立（UI 只采集/展示，识别走 `recognition` 模块）。
-                        ui.horizontal(|ui| {
-                            crate::ui::theme::tab_button(ui, "开始观察", MainTab::Observe, &mut self.active_tab);
-                            crate::ui::theme::tab_button(ui, "OCR 测试", MainTab::OcrTest, &mut self.active_tab);
-                            crate::ui::theme::tab_button(ui, "价格可视化", MainTab::PriceViz, &mut self.active_tab);
-                            crate::ui::theme::tab_button(ui, "数量采集", MainTab::QtyTool, &mut self.active_tab);
-                        });
-                        ui.separator();
-                        match self.active_tab {
-                            MainTab::Observe => crate::ui::control_panel::ControlPanel.show(ui, self),
-                            MainTab::OcrTest => crate::ui::ocr_test_panel::OcrTestPanel.show(ui, self),
-                            MainTab::PriceViz => {
-                                // 口径 / 子弹列表来自标定配置；记录缓存由面板按文件 mtime 失效重读。
-                                let calibers: Vec<String> = {
-                                    let mut v: Vec<String> = self.info.keys().cloned().collect();
-                                    v.sort();
-                                    v
-                                };
-                                let bullets: Vec<String> = self
-                                    .info
-                                    .get(&self.viz.caliber)
-                                    .map(|m| {
-                                        let mut v: Vec<String> = m.keys().cloned().collect();
-                                        v.sort();
-                                        v
-                                    })
-                                    .unwrap_or_default();
-                                let save_path = self.save_path.clone();
-                                price_viz::PriceVizPanel.show(
-                                    ui,
-                                    &mut self.viz,
-                                    &calibers,
-                                    &bullets,
-                                    &save_path,
-                                );
-                            }
-                            MainTab::QtyTool => {
-                                crate::ui::qty_tool_panel::QtyToolPanel.show(ui, self);
-                            }
+                    match self.page {
+                        Page::OrderAdjust => {
+                            // 顺序调整页：左右分栏（左 20% 口径 / 右 80% 子弹），两侧独立拖拽排序。
+                            crate::ui::order_page::show(ui, self);
                         }
-                    });
+                        Page::Main => {
+                            ui.vertical(|ui| {
+                                // Tab 切换栏：各 Tab 界面与处理逻辑相互独立（UI 只采集/展示，识别走 `recognition` 模块）。
+                                ui.horizontal(|ui| {
+                                    crate::ui::theme::tab_button(ui, "开始观察", MainTab::Observe, &mut self.active_tab);
+                                    crate::ui::theme::tab_button(ui, "OCR 测试", MainTab::OcrTest, &mut self.active_tab);
+                                    crate::ui::theme::tab_button(ui, "价格可视化", MainTab::PriceViz, &mut self.active_tab);
+                                    crate::ui::theme::tab_button(ui, "数量采集", MainTab::QtyTool, &mut self.active_tab);
+                                });
+                                ui.separator();
+                                match self.active_tab {
+                                    MainTab::Observe => crate::ui::control_panel::ControlPanel.show(ui, self),
+                                    MainTab::OcrTest => crate::ui::ocr_test_panel::OcrTestPanel.show(ui, self),
+                                    MainTab::PriceViz => {
+                                        // 口径 / 子弹列表来自标定配置；记录缓存由面板按文件 mtime 失效重读。
+                                        let calibers: Vec<String> = {
+                                            let mut v: Vec<String> = self.info.keys().cloned().collect();
+                                            v.sort();
+                                            v
+                                        };
+                                        let bullets: Vec<String> = self
+                                            .info
+                                            .get(&self.viz.caliber)
+                                            .map(|m| {
+                                                let mut v: Vec<String> = m.keys().cloned().collect();
+                                                v.sort();
+                                                v
+                                            })
+                                            .unwrap_or_default();
+                                        let save_path = self.save_path.clone();
+                                        price_viz::PriceVizPanel.show(
+                                            ui,
+                                            &mut self.viz,
+                                            &calibers,
+                                            &bullets,
+                                            &save_path,
+                                        );
+                                    }
+                                    MainTab::QtyTool => {
+                                        crate::ui::qty_tool_panel::QtyToolPanel.show(ui, self);
+                                    }
+                                }
+                            });
+
+                            // 主面板右上角：× 退出按钮（点击关闭程序）。
+                            egui::Area::new(egui::Id::new("main_exit_button"))
+                                .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-12.0, 10.0))
+                                .show(ctx, |ui| {
+                                    let btn = egui::Button::new(
+                                        egui::RichText::new("✕")
+                                            .size(18.0)
+                                            .color(Color32::from_rgb(120, 130, 150)),
+                                    )
+                                    .frame(true)
+                                    .fill(Color32::from_rgba_unmultiplied(240, 242, 246, 255))
+                                    .rounding(6.0)
+                                    .min_size(egui::vec2(30.0, 30.0));
+                                    if ui.add(btn).clicked() {
+                                        ctx.send_viewport_cmd(ViewportCommand::Close);
+                                    }
+                                });
+                        }
+                    }
                 });
             }
             Mode::Active => {
-                egui::CentralPanel::default()
-                    .frame(Frame::default().fill(Color32::TRANSPARENT))
-                    .show(ctx, |ui| crate::ui::floating_panel::FloatingPanel.show(ui, self));
+                // 窗口已为全屏透明、鼠标穿透：两个相互独立的毛玻璃组件分别锚定屏幕左上 / 右上角，
+                // 互不嵌套、互不干扰。毛玻璃底图由后台桌面采集（DXGI Desktop Duplication）持续产出，
+                // 每个面板把自己的屏幕坐标映射到该全屏模糊纹理的 UV 区间，作为自身半透明底图绘制
+                // （见 `floating_panel.rs` / `tour_guide_panel.rs`）。
+                let screen = ctx.input(|i| i.screen_rect);
+                let margin = 12.0;
+
+                // 拉取最新桌面帧 → 上传 / 更新毛玻璃纹理；并记录本帧屏幕矩形（供面板计算 UV）。
+                if let Some(cap) = &self.blur_capture {
+                    if let Some(img) = cap.take() {
+                        let opts = egui::TextureOptions::LINEAR;
+                        if let Some(tex) = &mut self.blur_tex {
+                            tex.set(img, opts);
+                        } else {
+                            self.blur_tex = Some(ctx.load_texture("delta_blur", img, opts));
+                        }
+                    }
+                    self.last_screen_rect = Some(screen);
+                }
+
+                // 状态面板：固定屏幕左上角。
+                egui::Area::new(egui::Id::new("active_status"))
+                    .fixed_pos(egui::pos2(margin, margin))
+                    .show(ctx, |ui| {
+                        crate::ui::floating_panel::FloatingPanel.show(ui, self);
+                    });
+
+                // 导游面板：固定屏幕右上角（仅待确认计划时渲染）。
+                if self.tour.pending_text().is_some() {
+                    let tour_x = screen.max.x - crate::FLOAT_W - margin;
+                    egui::Area::new(egui::Id::new("active_tour"))
+                        .fixed_pos(egui::pos2(tour_x, margin))
+                        .show(ctx, |ui| {
+                            crate::ui::tour_guide_panel::TourGuidePanel.show(ui, self);
+                        });
+                }
+                // 神经网络可视化：仅当用户按住 F2 时由 `draw_nn_viz` 内部判断并渲染，
+                // 松开即隐藏、暂停更新（函数内早期返回，无额外开销）。
+                self.draw_nn_viz(ctx);
             }
         }
 
-        // 保持事件循环持续重绘（约 30fps），确保 F9 即时响应。
+        // 保持事件循环持续重绘（约 30fps），确保 F9 即时响应与顺序调整页动画流畅。
         ctx.request_repaint_after(std::time::Duration::from_millis(30));
     }
 }
 
 fn main() -> eframe::Result<()> {
-    // 每次启动清空并初始化运行期排查日志（observe.log），避免旧日志跨班次累积消耗。
+    // 每次启动初始化运行期日志：写入项目根 `logs/run.log`（紧凑单行 JSON，AI 易解析）。
+    // 开发模式（debug 构建 / DELTA_OBSERVER_DEV=1）以截断模式**先清空**再写入；
+    // 生产模式（release）以追加方式保留历史。
     crate::log::init();
 
     // 声明 Per-Monitor V2 DPI 感知：使 `GetWindowRect`/`GetClientRect`/`ClientToScreen`/
@@ -875,7 +1158,6 @@ fn main() -> eframe::Result<()> {
         viewport: ViewportBuilder::default()
             .with_title(SELF_TITLE)
             .with_inner_size([IDLE_SIZE.0, IDLE_SIZE.1])
-            .with_resizable(false)
             .with_transparent(true),
         ..Default::default()
     };

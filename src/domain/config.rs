@@ -390,8 +390,8 @@ pub fn build_config() -> Config {
         &[
             ".357 Magnum FMJ",
             ".357 Magnum JHP",
-            ".357 Magnum 9号霰弹'鼠弹'",
             ".357 Magnum HP",
+            ".357 Magnum 9号霰弹'鼠弹'",
         ],
     );
 
@@ -402,9 +402,9 @@ pub fn build_config() -> Config {
             ".45 ACP Super",
             ".45 ACP AP",
             ".45 ACP FMJ",
-            ".45 ACP RIP",
             ".45 ACP JHP",
             ".45 ACP HS",
+            ".45 ACP RIP",
         ],
     );
 
@@ -424,10 +424,10 @@ pub fn build_config() -> Config {
             "12 Gauge 独头 AP-20",
             "12 Gauge 独头 FTX",
             "12 Gauge 箭形弹",
-            "12 Gauge 8.5毫米鹿弹",
-            "12 Gauge 独头RIP",
             "12 Gauge 独头 GT",
             "12 Gauge 7毫米鹿弹",
+            "12 Gauge 独头RIP",
+            "12 Gauge 8.5毫米鹿弹",
         ],
     );
 
@@ -475,9 +475,9 @@ pub fn build_config() -> Config {
             "5.7x28mm SS193",
             "5.7x28mm HT",
             "5.7x28mm L191",
-            "5.7x28mm R37.F",
             "5.7x28mm SS197SR",
             "5.7x28mm SS198LF",
+            "5.7x28mm R37.F",
         ],
     );
 
@@ -533,9 +533,9 @@ pub fn build_config() -> Config {
         &[
             "9x19mm PBP",
             "9x19mm AP6.3",
-            "9x19mm RIP",
             "9x19mm Pst",
             "9x19mm PSO",
+            "9x19mm RIP",
         ],
     );
 
@@ -549,12 +549,12 @@ pub fn build_config() -> Config {
         &mut cfg,
         "4.6x30",
         &[
-            "4.6x30mm AP SX",
             "4.6x30mm AP ST",
-            "4.6x30mm CT",
+            "4.6x30mm AP SX",
             "4.6x30mm FMJ ST",
             "4.6x30mm FMJ SX",
             "4.6x30mm Subsonic SX",
+            "4.6x30mm CT",
         ],
     );
 

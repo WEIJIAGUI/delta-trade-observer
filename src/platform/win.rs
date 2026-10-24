@@ -1,6 +1,11 @@
 //! Windows 平台窗口操作封装：查找游戏窗口、激活并聚焦窗口、
-//! 截图排除（SetWindowDisplayAffinity）、毛玻璃（DwmEnableBlurBehindWindow）、
-//! 模拟人类键鼠输入（SendInput），以及内置轻量提示音合成。
+//! 截图排除（SetWindowDisplayAffinity）、模拟人类键鼠输入（SendInput），
+//! 以及内置轻量提示音合成。
+//!
+//! 毛玻璃（磨砂半透明）效果不再由本模块提供：原先的 `DwmEnableBlurBehindWindow`
+//! 仅适用于 GDI 分层窗口，在本程序的 swapchain 透明窗口上会合成黑屏；现改为
+//! `src/platform/dxgi_capture.rs` 用 DXGI Desktop Duplication 自采集桌面并模糊，
+//! 由 `ui/` 下面板作为底图绘制。
 //!
 //! 截图相关能力（窗口/客户区/区域截图、裁剪、保存、标注）已迁移至独立模块
 //! `src/screenshot.rs`，本文件不再包含截图实现。
@@ -11,8 +16,9 @@ use std::thread;
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{BOOL, HMODULE, HWND, LPARAM, POINT, TRUE, FALSE};
-use windows::Win32::Graphics::Dwm::{DwmEnableBlurBehindWindow, DWM_BLURBEHIND};
-use windows::Win32::Graphics::Gdi::{ClientToScreen, HRGN};
+use windows::Win32::Graphics::Gdi::{
+    ClientToScreen,
+};
 use windows::Win32::Media::Audio::{PlaySoundW, SND_MEMORY, SND_NODEFAULT};
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -166,24 +172,9 @@ pub fn set_exclude_from_capture(hwnd: HWND, exclude: bool) {
     }
 }
 
-/// 为窗口启用 / 禁用 DWM 毛玻璃（背景模糊），实现真正的 frosted glass 观感。
-///
-/// 仅对分层（透明）窗口生效。`hRgnBlur = NULL` 时整窗模糊；
-/// 失败（如旧系统不支持）不影响程序运行 —— egui 的半透明面板自身也已具备毛玻璃观感。
-pub fn set_window_blur(hwnd: HWND, enable: bool) {
-    unsafe {
-        let bb = DWM_BLURBEHIND {
-            dwFlags: 0x1 | 0x2, // DWM_BB_ENABLE | DWM_BB_BLURREGION
-            fEnable: BOOL(if enable { 1 } else { 0 }),
-            hRgnBlur: HRGN::default(),
-            fTransitionOnMaximized: BOOL(0),
-        };
-        let _ = DwmEnableBlurBehindWindow(hwnd, &bb);
-    }
-}
-
 // ====================== 截图功能已迁移至 `src/screenshot.rs` ======================
-// 本文件保留：窗口查找 / 聚焦 / 截图排除 / 毛玻璃 / 模拟键鼠 / 提示音。
+// 本文件保留：窗口查找 / 聚焦 / 截图排除（WDA）/ 模拟键鼠 / 提示音。
+// 毛玻璃（磨砂半透明）由 `src/platform/dxgi_capture.rs` + `ui/` 下面板实现，本文件不再提供。
 
 /// 合成一段简短的提示音 WAV（PCM 16bit 单声道），双音上行，asset-free。
 /// 返回完整 WAV 字节（含 44 字节文件头）。
@@ -430,8 +421,8 @@ fn mouse_click_screen(x: i32, y: i32) {
     });
 }
 
-/// 把客户区坐标 `(x, y)` 转换为屏幕坐标（供鼠标点击）。失败返回 `None`。
-fn client_to_screen(hwnd: HWND, x: i32, y: i32) -> Option<(i32, i32)> {
+/// 把客户区坐标 `(x, y)` 转换为屏幕坐标（供鼠标点击 / 可视化标注）。失败返回 `None`。
+pub fn client_to_screen(hwnd: HWND, x: i32, y: i32) -> Option<(i32, i32)> {
     unsafe {
         let mut pt = POINT { x, y };
         if ClientToScreen(hwnd, &mut pt).as_bool() {
@@ -440,6 +431,14 @@ fn client_to_screen(hwnd: HWND, x: i32, y: i32) -> Option<(i32, i32)> {
             None
         }
     }
+}
+
+/// 把客户区矩形 `[x, y, w, h]` 的两个角点都转换为屏幕坐标，返回屏幕矩形；
+/// 任一角点转换失败返回 `None`。供神经网络可视化图层把检测框绘制到屏幕对应位置。
+pub fn client_rect_to_screen(hwnd: HWND, rect: [i32; 4]) -> Option<[i32; 4]> {
+    let (x0, y0) = client_to_screen(hwnd, rect[0], rect[1])?;
+    let (x1, y1) = client_to_screen(hwnd, rect[0] + rect[2], rect[1] + rect[3])?;
+    Some([x0, y0, x1 - x0, y1 - y0])
 }
 
 /// 模拟人类在商品检索栏输入指定文本：

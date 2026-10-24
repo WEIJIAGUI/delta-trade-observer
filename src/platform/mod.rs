@@ -4,3 +4,4 @@
 pub mod win;
 pub mod screenshot;
 pub mod hotkey_hook;
+pub mod dxgi_capture;

@@ -41,8 +41,15 @@ const BUY_POLL_MAX: usize = 30;
 /// 购买阶段数位裁剪文件名序号（进程内单调递增，跨多次购买事件保证不重名）。
 static BUY_DIGIT_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// 购买阶段数量调整：单次加/减点击后等待界面刷新的间隔（ms）。
+/// 购买阶段数量调整：单步（残差校正）加/减点击后等待界面刷新的间隔（ms）。
 const ADJUST_STEP_MS: u64 = 150;
+
+/// 购买阶段数量调整：批量微调时连续点击之间的最小间隔（ms）。
+///
+/// 批量微调一次性派发 `|差值|` 次加/减点击，**不在每次点击间做 CNN 识别**，仅在间隔中轮询
+/// 中止信号并确保点击被游戏注册。取值远小于 [`ADJUST_STEP_MS`]，是「逐次识别」旧实现的核心提速点；
+/// 末尾「单次验证 + 残差校正」会兜住个别被游戏丢弃的点击，故取较小值仍保证最终对齐。
+const BATCH_CLICK_MS: u64 = 50;
 
 /// 购买阶段每个数位的裁剪样本：`(RGBA 像素, 宽, 高, 识别标签)`。
 /// 识别标签为神经网络判定字符（非数字类为 `None`，落盘时记为 `x`）。
@@ -173,22 +180,17 @@ pub enum QtyAdjustResult {
 /// 与数据集采集工具 `qty_tool` 一致改用标定模板，从根本上杜绝「点加号却点到购买」的误购风险（缺陷 D1）。
 /// 模板坐标与数量无关、恒定无抖动，也规避了「检测器只跑一次、坐标冻结复用」的陈旧错位（缺陷 D2）。
 ///
-/// **不再设总体次数上限**：循环持续至数量对齐到 `target_qty`（返回 [`Confirmed`]）或单步重试耗尽
-/// （返回 [`Unconfirmed`]）。进入循环前先做**快速调整（滑块跳转）**：从 [`QTY_SLIDER_REFS`] 已知参考点中
-/// 选取离 `target_qty` 最近者，点击数量滑块跳到该参考数量（仅当跳转后离目标更近才执行，避免越跳越远），
-/// 以大幅减少后续加减次数；跳转后由下方加减循环精确微调兜底。每步（一次加/减点击）逻辑：
-/// 1. **调整前**：用 CNN（`recognize_buy_qty`）识别并记录当前数量 `before`；
-/// 2. 点击「加」（`before < target`）或「减」（`before > target`）按钮；
-/// 3. **调整后**：再次用 CNN 识别 `after`，与 `before` 对比：
-///    - `after != before` → 本次调整生效，回到步骤 1 继续后续调整；
-///    - `after == before` → 本次调整未生效，自动重试（最多 [`MAX_RETRIES`]=3 次）；
-/// 4. 单步重试次数耗尽仍 `after == before` → 落点失效 / 点击未生效，返回 [`Unconfirmed`]，由
-///    `observe` 统一 ESC（不购买）。
+/// **性能优化（响应速度）**：旧实现每点一次加/减都「识别前 → 点击 → 识别后」共两次 CNN 推理 + 一次
+/// 固定等待，调整数量差 N 时需约 2N 次推理与 N 次等待，N 很大时极慢。本实现改为三段式：
+/// 1. **粗调（滑块跳转）**：先点数量滑块跳到离目标最近的已知参考点（`[`QTY_SLIDER_REFS`]`），一次点击抵多步；
+/// 2. **批量微调（核心提速）**：按「当前识别数 → 目标」的差值，一次性连续派发 `|差值|` 次加/减点击，
+///    仅保留极小间隔（[`BATCH_CLICK_MS`]）用于轮询中止信号与确保点击被游戏注册，**不再逐次识别**；
+/// 3. **单次验证 + 残差校正**：批量派发后只识别一次核对终值；若个别点击被游戏丢弃导致偏离，再进入
+///    单步精确校正（含重试）兜底，保证最终严格对齐到目标值。
+/// 这样将 CNN 识别次数从 O(N) 降至 O(1)，等待时间成比例下降，大数量差场景提速数倍到数十倍，且通过
+/// 末尾的核对与校正循环保持「对齐才购买」的强约束不变。
 /// 任一识别失败（`recognize_buy_qty` 返回 `None`）即保守停止调整、返回 [`Unconfirmed`]（不卡死、不误购）。
 /// 点击坐标转换失败（无法派发）同样立即返回 [`Unconfirmed`]，不做无意义重试。
-/// 购买界面「数量滑块」参考点选取：从 [`QTY_SLIDER_REFS`] 中挑出「数量值」离 `target` 最近的已知点。
-///
-/// 该表后续追加更多参考点后，数量调整会自动就近选用，无需改动调用逻辑（见 [`adjust_buy_qty`]）。
 fn nearest_ref_point(target: u32) -> Option<(u32, i32)> {
     let mut best: Option<(u32, i32)> = None;
     let mut best_dist: i64 = i64::MAX;
@@ -230,46 +232,116 @@ fn adjust_buy_qty(
     let plus = scale.rect(layout.plus);
     let buy = scale.rect(layout.buy);
 
-    // —— 快速调整（滑块跳转）：先点滑块跳到离目标最近的已知参考点，减少后续加减次数 ——
-    // 仅当跳转后离目标更近才执行（避免越跳越远）；跳转后由下方加减循环兜底精确微调。
-    // 滑块点击失败（坐标转换失败）或跳转后未生效时，下方循环会从当前数量照常加减微调，无副作用。
-    if let Some(cur0) = recognize_buy_qty(hwnd, scale, scene) {
-        let _ = tx.send(ObserveMsg::DetectedQty { qty: Some(cur0) });
-        if cur0 != target_qty {
-            if let Some((ref_qty, ref_dx)) = nearest_ref_point(target_qty) {
-                let cur_dist = (cur0 as i64 - target_qty as i64).abs();
-                let ref_dist = (ref_qty as i64 - target_qty as i64).abs();
-                if ref_dist < cur_dist {
-                    let pos = slider_click_rect(scene, scale, ref_dx);
-                    if win::click_client_rect(hwnd, pos) {
-                        crate::log::write(&format!(
-                            "[L3] 快速调整：点数量滑块跳至参考点 {ref_qty} 发（目标 {target_qty} 发）"
-                        ));
-                        if sleep_interruptible(ADJUST_STEP_MS, stop) {
-                            // 等待期间收到中止信号：提前结束，未确认 → 不购买。
-                            crate::log::write("[L3] 快速调整等待期间收到停止信号，结束调整（未确认，不购买）");
-                            let _ = tx.send(ObserveMsg::DetectedQty { qty: None });
-                            win::move_mouse_to_client(hwnd, buy);
-                            return QtyAdjustResult::Unconfirmed;
-                        }
-                        if let Some(jumped) = recognize_buy_qty(hwnd, scale, scene) {
-                            crate::log::write(&format!(
-                                "[L3] 滑块跳转后识别数量={jumped}（参考点 {ref_qty}，目标 {target_qty}）"
-                            ));
-                            let _ = tx.send(ObserveMsg::DetectedQty { qty: Some(jumped) });
-                        }
-                    } else {
-                        crate::log::write("[L3] 快速调整：点滑块失败（坐标转换失败，改用加减按钮微调）");
-                    }
+    // —— 初识当前数量（作为后续批量/校正基准）——
+    let mut cur = match recognize_buy_qty(hwnd, scale, scene) {
+        Some(c) => {
+            let _ = tx.send(ObserveMsg::DetectedQty { qty: Some(c) });
+            crate::log::write(&format!("[L3] 识别数量={c}，目标={target_qty}"));
+            c
+        }
+        None => {
+            // 识别失败：无法判定基准，保守停止调整（不购买）。
+            crate::log::write("[L3] 数量识别失败(qty=None)，保守停止调整（未确认）");
+            let _ = tx.send(ObserveMsg::DetectedQty { qty: None });
+            win::move_mouse_to_client(hwnd, buy);
+            return QtyAdjustResult::Unconfirmed;
+        }
+    };
+    if cur == target_qty {
+        // 数量已对齐并确认：允许触发购买（后续 Proceed 唯一产出条件）。
+        win::move_mouse_to_client(hwnd, buy);
+        crate::log::write("[OK] 数量已对齐并确认，允许触发购买");
+        return QtyAdjustResult::Confirmed(cur);
+    }
+
+    // —— 粗调（滑块跳转）：点滑块跳到离目标最近的已知参考点，一次点击抵多步 ——
+    // 仅当跳转后离目标更近才执行（避免越跳越远）；跳转后由下方批量/校正兜底。
+    if let Some((ref_qty, ref_dx)) = nearest_ref_point(target_qty) {
+        let cur_dist = (cur as i64 - target_qty as i64).abs();
+        let ref_dist = (ref_qty as i64 - target_qty as i64).abs();
+        if ref_dist < cur_dist {
+            let pos = slider_click_rect(scene, scale, ref_dx);
+            if win::click_client_rect(hwnd, pos) {
+                crate::log::write(&format!(
+                    "[L3] 快速调整：点数量滑块跳至参考点 {ref_qty} 发（目标 {target_qty} 发）"
+                ));
+                if sleep_interruptible(ADJUST_STEP_MS, stop) {
+                    // 等待期间收到中止信号：提前结束，未确认 → 不购买。
+                    crate::log::write("[L3] 快速调整等待期间收到停止信号，结束调整（未确认，不购买）");
+                    let _ = tx.send(ObserveMsg::DetectedQty { qty: None });
+                    win::move_mouse_to_client(hwnd, buy);
+                    return QtyAdjustResult::Unconfirmed;
                 }
+                if let Some(jumped) = recognize_buy_qty(hwnd, scale, scene) {
+                    crate::log::write(&format!(
+                        "[L3] 滑块跳转后识别数量={jumped}（参考点 {ref_qty}，目标 {target_qty}）"
+                    ));
+                    let _ = tx.send(ObserveMsg::DetectedQty { qty: Some(jumped) });
+                    cur = jumped;
+                }
+            } else {
+                crate::log::write("[L3] 快速调整：点滑块失败（坐标转换失败，改用加/减按钮微调）");
             }
         }
     }
+    if cur == target_qty {
+        win::move_mouse_to_client(hwnd, buy);
+        crate::log::write("[OK] 数量已对齐并确认（滑块跳转），允许触发购买");
+        return QtyAdjustResult::Confirmed(cur);
+    }
 
-    // 单步调整（一次加/减点击）的最大重试次数：点击后若数量未变化，说明本次调整未生效，自动重试，最多 3 次。
+    // —— 批量微调（核心提速）：一次性派发 |差值| 次点击，不逐次识别 ——
+    // 每次加/减点击使数量确定性 +1/-1，故直接按差值连续派发；仅保留极小间隔（[`BATCH_CLICK_MS`]）
+    // 用于轮询中止信号并确保点击被游戏注册。末尾「单次验证 + 残差校正」保证最终严格对齐。
+    let delta = target_qty as i64 - cur as i64;
+    let button = if delta > 0 { plus } else { minus };
+    let dir = if delta > 0 { "加" } else { "减" };
+    let steps = delta.unsigned_abs();
+    if steps > 0 {
+        for _ in 0..steps {
+            if stop.load(Ordering::Relaxed) {
+                crate::log::write("[L3] 批量调整期间收到停止信号，结束调整（未确认，不购买）");
+                let _ = tx.send(ObserveMsg::DetectedQty { qty: None });
+                win::move_mouse_to_client(hwnd, buy);
+                return QtyAdjustResult::Unconfirmed;
+            }
+            if !win::click_client_rect(hwnd, button) {
+                // 坐标转换失败，无法派发点击：无法调整，直接中止（重试无意义）。
+                crate::log::write(&format!(
+                    "[L3] 批量点击{dir}按钮失败（坐标转换失败，未派发），中止调整（不购买）"
+                ));
+                let _ = tx.send(ObserveMsg::DetectedQty { qty: None });
+                win::move_mouse_to_client(hwnd, buy);
+                return QtyAdjustResult::Unconfirmed;
+            }
+            // 批量内最小间隔：仅轮询 stop，不再识别（识别成本已外移）。
+            if sleep_interruptible(BATCH_CLICK_MS, stop) {
+                crate::log::write("[L3] 批量调整间隔期间收到停止信号，结束调整（未确认，不购买）");
+                let _ = tx.send(ObserveMsg::DetectedQty { qty: None });
+                win::move_mouse_to_client(hwnd, buy);
+                return QtyAdjustResult::Unconfirmed;
+            }
+        }
+        // 单次验证：批量派发后只识别一次核对终值。
+        if let Some(after) = recognize_buy_qty(hwnd, scale, scene) {
+            crate::log::write(&format!(
+                "[L3] 批量调整完成，核对数量={after}（目标 {target_qty}）"
+            ));
+            let _ = tx.send(ObserveMsg::DetectedQty { qty: Some(after) });
+            cur = after;
+        } else {
+            crate::log::write("[L3] 批量调整后识别失败(qty=None)，进入残差校正");
+        }
+    }
+    if cur == target_qty {
+        win::move_mouse_to_client(hwnd, buy);
+        crate::log::write("[OK] 数量已对齐并确认（批量微调），允许触发购买");
+        return QtyAdjustResult::Confirmed(cur);
+    }
+
+    // —— 残差校正：批量可能漏点/误点导致偏离，单步精确修正（含重试）直到对齐或失败 ——
+    // 此循环仅在批量未精确命中时执行，残差通常很小，故整体耗时仍远低于「逐次识别」旧实现。
     const MAX_RETRIES: usize = 3;
-
-    // 不再设总体次数上限：循环持续至数量对齐到目标值（Confirmed）或单步重试耗尽（Unconfirmed）。
     loop {
         if stop.load(Ordering::Relaxed) {
             // 收到中止信号：立即结束数量调整，未确认 → 不购买，由 observe 统一 ESC。
@@ -278,17 +350,16 @@ fn adjust_buy_qty(
             win::move_mouse_to_client(hwnd, buy);
             return QtyAdjustResult::Unconfirmed;
         }
-        // 调整前：用 CNN 识别并记录当前数量（作为本次调整的「前」基准，供点击后对比）。
+        // 调整前：用 CNN 识别并记录当前数量（作为本次调整的「前」基准）。
         let before = match recognize_buy_qty(hwnd, scale, scene) {
             Some(c) => {
-                // 实时上报当前识别到的数量，毛玻璃面板持续刷新（供实机核对减/加落点）。
                 let _ = tx.send(ObserveMsg::DetectedQty { qty: Some(c) });
-                crate::log::write(&format!("[L3] 识别数量={c}，目标={target_qty}"));
+                crate::log::write(&format!("[L3] 校正识别数量={c}，目标={target_qty}"));
                 c
             }
             None => {
-                // 识别失败：无法判定基准与后续对比，保守停止调整（不购买）。
-                crate::log::write("[L3] 数量识别失败(qty=None)，保守停止调整（未确认）");
+                // 识别失败：无法判定基准，保守停止调整（不购买）。
+                crate::log::write("[L3] 残差校正识别失败(qty=None)，保守停止调整（未确认）");
                 let _ = tx.send(ObserveMsg::DetectedQty { qty: None });
                 win::move_mouse_to_client(hwnd, buy);
                 return QtyAdjustResult::Unconfirmed;
@@ -297,7 +368,7 @@ fn adjust_buy_qty(
         if before == target_qty {
             // 数量已对齐并确认：允许触发购买（后续 Proceed 唯一产出条件）。
             win::move_mouse_to_client(hwnd, buy);
-            crate::log::write("[OK] 数量已对齐并确认，允许触发购买");
+            crate::log::write("[OK] 数量已对齐并确认（残差校正），允许触发购买");
             return QtyAdjustResult::Confirmed(before);
         }
         // 选择按钮：偏少点加、偏多点减。
@@ -520,6 +591,17 @@ pub fn verify_then_decide(
             // 模型缺失 / 推理失败时 det 为 None，scene 为 None，照常继续，不影响既有扫描与判定。
             let det = buttons::detect_buttons(hwnd, scale);
             let scene = det.as_ref().and_then(|d| d.scene);
+            crate::log::event(
+                "BUTTONS",
+                "detect",
+                &format!(
+                    "\"scene\":\"{}\",\"buy\":{},\"minus\":{},\"plus\":{}",
+                    scene.map(|s| s.label()).unwrap_or("none"),
+                    crate::log::fmt_opt_rect(det.as_ref().and_then(|d| d.buy)),
+                    crate::log::fmt_opt_rect(det.as_ref().and_then(|d| d.minus)),
+                    crate::log::fmt_opt_rect(det.as_ref().and_then(|d| d.plus)),
+                ),
+            );
             if v < th {
                 // 购买阶段数量调整 + 闸门：仅当「场景已判定」且「数量已确认对齐到目标值」时，才产出 Proceed
                 // （触发购买）。按钮坐标统一取自场景标定模板（见 adjust_buy_qty），不再依赖检测器对
@@ -612,6 +694,26 @@ pub fn verify_then_decide(
             BuyDecision::Abort { scene }
         }
     };
+    // 关键节点日志：购买决策结果（结构化，便于 AI 解析与定位「找不到按钮」等异常）。
+    let decision_kind = match &decision {
+        BuyDecision::Proceed { .. } => "Proceed",
+        BuyDecision::Abort { .. } => "Abort",
+        BuyDecision::Skip => "Skip",
+    };
+    let scene_label = match &decision {
+        BuyDecision::Proceed { scene, .. } | BuyDecision::Abort { scene } => {
+            scene.map(|s| s.label()).unwrap_or("none")
+        }
+        BuyDecision::Skip => "none",
+    };
+    crate::log::event(
+        "BUY",
+        "decide",
+        &format!(
+            "\"decision\":\"{}\",\"scene\":\"{}\"",
+            decision_kind, scene_label
+        ),
+    );
     decision
 }
 

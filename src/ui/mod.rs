@@ -3,8 +3,10 @@
 //! `crate::domain` 模块。
 
 pub mod theme;
+pub mod order_page;
 pub mod control_panel;
 pub mod floating_panel;
+pub mod tour_guide_panel;
 pub mod ocr_test_panel;
 pub mod price_viz_panel;
 pub mod qty_tool_panel;

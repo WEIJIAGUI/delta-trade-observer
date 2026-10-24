@@ -331,14 +331,19 @@ fn score_lower_price(roi_rgba: &[u8], rw: i32, rh: i32) -> f32 {
 
 /// 点击「购买」后监听结果 toast，归类为两种购买成功之一。
 ///
-/// 在 [`MONITOR_MS`] 监听窗内反复截取客户区、推导监听带、做绿字门控与模板匹配，
-/// 累计 NCC 峰值：峰值过阈即提前返回「低价购买成功」；窗内检测到绿字但峰值未过阈
-/// 返回「正常购买成功」；全程未见绿字返回 `None`（点击可能静默失败，由调用方记日志，
+/// 在 [`MONITOR_MS`] 监听窗内反复截取客户区、推导监听带、做绿字门控与模板匹配：
+/// - NCC 峰值过阈即提前返回「低价购买成功」；
+/// - 绿字连续稳定 2 帧（≈180ms）且 NCC 明显低于低价阈值，即提前返回「正常购买成功」
+///   （加速：免去余下监听窗等待，正常成交判定由 ~3s 缩至 ~0.5s）；
+/// - 窗结束仍未见绿字稳定 2 帧（或全程无绿字）则按原逻辑兜底返回。
+/// 全程未见绿字返回 `None`（点击可能静默失败，由调用方记日志，
 /// 本模块不做失败处理——按需求失败类不在范围）。
 pub fn monitor_after_buy(hwnd: HWND, stop: &AtomicBool) -> Option<BuyToastKind> {
     let cap = ClientCapturer::new(hwnd);
     let mut max_ncc = 0f32;
     let mut seen_green = false;
+    // 连续绿字帧计数：用于「稳定 2 帧(~180ms)即判定正常成交」的提前返回（见循环内）。
+    let mut green_streak = 0u32;
     let mut waited = 0u64;
     while waited < MONITOR_MS {
         if stop.load(Ordering::Relaxed) {
@@ -353,16 +358,30 @@ pub fn monitor_after_buy(hwnd: HWND, stop: &AtomicBool) -> Option<BuyToastKind> 
                         seen_green = true;
                         crate::log::write("[TOAST] 检测到购买成功 toast（绿字）");
                     }
+                    green_streak += 1;
                     let s = score_lower_price(&roi, rw, rh);
                     if s > max_ncc {
                         max_ncc = s;
                     }
                     if max_ncc >= NCC_LOWER_THRESHOLD {
                         crate::log::write(&format!(
-                            "[TOAST] NCC={s:.3} ≥ {NCC_LOWER_THRESHOLD} → 低价购买成功（提前命中）"
+                            "[TOAST] NCC={max_ncc:.3} ≥ {NCC_LOWER_THRESHOLD} → 低价购买成功（提前命中）"
                         ));
                         return Some(BuyToastKind::LowerPriceSuccess);
                     }
+                    // 加速：绿字已连续稳定 2 帧（≈180ms）且 NCC 明显低于低价阈值，
+                    // 即可确定本次为「正常购买成功」，无需再等满 3s 监听窗。
+                    // 低价成交的 NCC 远高于阈值，2 帧内已必定命中上一分支提前返回，
+                    // 故此处不会把低价为正常误判；稳定 2 帧也过滤了瞬态绿字抖动。
+                    if green_streak >= 2 {
+                        crate::log::write(&format!(
+                            "[TOAST] 绿字稳定 {green_streak} 帧、NCC={max_ncc:.3} < {NCC_LOWER_THRESHOLD} → 正常购买成功（提前判定）"
+                        ));
+                        return Some(BuyToastKind::NormalSuccess);
+                    }
+                } else {
+                    // 本帧无绿字（toast 尚未弹出 / 已淡出）→ 连续计数清零，避免抖动误判。
+                    green_streak = 0;
                 }
             }
         }

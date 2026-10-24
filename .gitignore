@@ -20,3 +20,9 @@ nn-classifier/button_dataset
 nn-classifier/qty_dataset
 
 target_verify
+
+# 运行期统一日志目录（logs/run.log，含运行轨迹，不纳入版本管理）
+/logs/
+
+
+/assets/bullets
